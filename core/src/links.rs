@@ -165,7 +165,8 @@ fn apply_security(m: &mut Map<String, Value>, q: &Query, security: &str, net: &s
                 m.insert("skip-cert-verify".into(), true.into());
             }
         }
-        "" | "none" => {}
+        // some generators write "false", "0" or vmess-style "auto" for "no TLS"
+        "" | "none" | "false" | "0" | "auto" => {}
         other => return Err(format!("security={other} не поддерживается")),
     }
     Ok(())
@@ -191,8 +192,10 @@ fn ws_path(path: &str) -> (String, Option<u64>) {
 }
 
 fn apply_transport(m: &mut Map<String, Value>, q: &Query, net: &str, allowed: &[&str]) -> Result<(), String> {
+    // an encoded '#' sometimes glues the server name onto the last parameter
+    let net = net.split('#').next().unwrap_or("").trim();
     let net = match net {
-        "" | "raw" => "tcp",
+        "" | "raw" | "none" => "tcp",
         "splithttp" => "xhttp",
         "kcp" => "mkcp",
         "http" => {

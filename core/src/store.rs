@@ -245,12 +245,35 @@ pub fn is_dead(s: &Server, now: u64) -> bool {
     }
 }
 
+/// What `prune` removed: `dead` failed for days (buried for `GRAVE_TTL`), `trimmed`
+/// were tested, failing and pushed out by the size cap (buried briefly: they may simply
+/// have been unlucky), `dropped` were never tested (not buried at all — the next fetch of
+/// their list may bring them back and they deserve a test).
+#[derive(Default, Debug)]
+pub struct Pruned {
+    pub dead: Vec<String>,
+    pub trimmed: Vec<String>,
+    pub dropped: Vec<String>,
+}
+
+impl Pruned {
+    pub fn len(&self) -> usize {
+        self.dead.len() + self.trimmed.len() + self.dropped.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// How long a server pushed out by the size cap is refused.
+pub const TRIM_TTL: u64 = 2 * 86400;
+
 /// Drops free servers that are dead or stale (not seen working for a week and not checked
 /// for three days), then trims the database to `MAX_FREE` free servers: failing ones go
 /// first (the longest-failing first), untested ones next, working ones never. Favourites
-/// are kept. Returns the removed ids.
-pub fn prune(servers: &mut Vec<Server>, now: u64) -> Vec<String> {
-    let mut gone = Vec::new();
+/// are kept.
+pub fn prune_ex(servers: &mut Vec<Server>, now: u64) -> Pruned {
+    let mut out = Pruned::default();
     servers.retain(|s| {
         if s.origin != Origin::Free || s.fav {
             return true;
@@ -260,7 +283,7 @@ pub fn prune(servers: &mut Vec<Server>, now: u64) -> Vec<String> {
         let worked = now.saturating_sub(s.last_ok) < 7 * 86400;
         let keep = (fresh || worked) && !is_dead(s, now);
         if !keep {
-            gone.push(s.id.clone());
+            if s.probe.is_some() { out.dead.push(s.id.clone()) } else { out.dropped.push(s.id.clone()) }
         }
         keep
     });
@@ -274,11 +297,30 @@ pub fn prune(servers: &mut Vec<Server>, now: u64) -> Vec<String> {
             .map(|s| (if s.probe.is_some() { 0 } else { 1 }, s.last_ok, s.added, s.id.clone()))
             .collect();
         cand.sort();
-        let drop: HashSet<String> = cand.into_iter().take(n - MAX_FREE).map(|c| c.3).collect();
-        servers.retain(|s| !drop.contains(&s.id));
-        gone.extend(drop);
+        let drop: Vec<(u8, u64, u64, String)> = cand.into_iter().take(n - MAX_FREE).collect();
+        let ids: HashSet<String> = drop.iter().map(|c| c.3.clone()).collect();
+        servers.retain(|s| !ids.contains(&s.id));
+        for (class, _, _, id) in drop {
+            if class == 0 { out.trimmed.push(id) } else { out.dropped.push(id) }
+        }
     }
-    gone
+    out
+}
+
+/// `prune_ex` flattened to the removed ids.
+pub fn prune(servers: &mut Vec<Server>, now: u64) -> Vec<String> {
+    let p = prune_ex(servers, now);
+    p.dead.into_iter().chain(p.trimmed).chain(p.dropped).collect()
+}
+
+/// Buries ids for `ttl` seconds instead of the full `GRAVE_TTL` (the stored time is
+/// backdated, so the file format stays the same).
+pub fn bury_for(grave: &mut Grave, ids: &[String], now: u64, ttl: u64) {
+    let t = now.saturating_sub(GRAVE_TTL.saturating_sub(ttl));
+    for id in ids {
+        let e = grave.entry(id.clone()).or_insert(t);
+        *e = (*e).max(t);
+    }
 }
 
 /// Records buried ids and forgets old graves (and the oldest ones beyond the cap).
@@ -393,5 +435,24 @@ mod tests {
         let mut fresh = Settings::default();
         assert!(!fresh.migrate());
         assert_eq!(fresh.routes, Routes::default());
+    }
+
+    #[test]
+    fn cap_does_not_bury_untested() {
+        let now = 100 * 86400;
+        let mut all = Vec::new();
+        for i in 0..(MAX_FREE + 10) {
+            let mut s = Server::new(&format!("u{i}"), serde_json::from_value(serde_json::json!({"type":"trojan","server":format!("10.0.{}.{}", i / 250, i % 250),"port":443,"password":"x"})).unwrap(), Origin::Free, "t").unwrap();
+            s.added = now;
+            all.push(s);
+        }
+        let p = prune_ex(&mut all, now);
+        assert_eq!(all.len(), MAX_FREE);
+        assert_eq!(p.dropped.len(), 10);
+        assert!(p.dead.is_empty() && p.trimmed.is_empty());
+        let mut g = Grave::new();
+        bury_for(&mut g, &["a".to_string()], now, TRIM_TTL);
+        let t = g["a"];
+        assert!(now - t < GRAVE_TTL && now + TRIM_TTL - t >= GRAVE_TTL);
     }
 }

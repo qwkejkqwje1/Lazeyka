@@ -536,11 +536,12 @@ impl Engine {
         let (servers, stats, grave, gone) = {
             let mut st = self.st.lock().unwrap();
             let now = util::now();
-            let gone = store::prune(&mut st.servers, now);
-            if !gone.is_empty() {
-                store::bury(&mut st.grave, &gone, now);
+            let gone = store::prune_ex(&mut st.servers, now);
+            if !gone.dead.is_empty() || !gone.trimmed.is_empty() {
+                store::bury_for(&mut st.grave, &gone.trimmed, now, store::TRIM_TTL);
+                store::bury(&mut st.grave, &gone.dead, now);
             }
-            (st.servers.clone(), st.stats.clone(), st.grave.clone(), gone.len())
+            (st.servers.clone(), st.stats.clone(), st.grave.clone(), gone.dead.len() + gone.trimmed.len())
         };
         if gone > 0 {
             self.log(&format!("убрано мёртвых серверов: {gone}; в базе {}", servers.len()));
@@ -597,6 +598,11 @@ impl Engine {
                 stt.tested += 1;
                 if s.good() {
                     stt.good += 1;
+                }
+                // lists change: let the ratio follow the last few thousand checks
+                if stt.tested >= 4000 {
+                    stt.tested /= 2;
+                    stt.good /= 2;
                 }
             }
         }
@@ -1672,6 +1678,8 @@ impl Engine {
         }
         // 4. public sources, tier by tier until enough good servers
         let srcs = settings.sources();
+        let seen_file = self.paths.cache().join("seen.json");
+        let mut seen: HashMap<String, u64> = store::load(&seen_file);
         let fc = sources::fetch_client();
         for tier in 1..=3u8 {
             if env.cancel.load(Ordering::Relaxed) {
@@ -1693,18 +1701,35 @@ impl Engine {
                     (d, r)
                 });
             }
+            // Candidates of this tier that are not in the database yet. They stay in memory:
+            // the database keeps only tested servers, so a long list can neither crowd out
+            // the known ones nor get itself buried untested by the size cap.
+            let mut fresh: Vec<Server> = Vec::new();
+            let mut fresh_ids: HashSet<String> = HashSet::new();
             while let Some(Ok((d, r))) = js.join_next().await {
                 match r {
                     Ok(text) => {
                         let rep = import::parse_text(&text);
                         let list: Vec<Server> = rep.items.into_iter().filter_map(|p| Server::new(&p.name, p.proxy, Origin::Free, &d.id).ok()).collect();
+                        let now = util::now();
                         let mut st = self.st.lock().unwrap();
                         let e = st.stats.entry(d.id.clone()).or_default();
-                        e.fetched = util::now();
+                        e.fetched = now;
                         e.parsed = list.len();
                         e.error = None;
+                        let known: HashSet<&str> = st.servers.iter().map(|s| s.id.as_str()).collect();
+                        let mut add = Vec::new();
+                        for mut s in list {
+                            let buried = st.grave.get(&s.id).is_some_and(|t| now.saturating_sub(*t) < store::GRAVE_TTL);
+                            if buried || known.contains(s.id.as_str()) || !fresh_ids.insert(s.id.clone()) {
+                                continue;
+                            }
+                            // first sighting, remembered across scans: "new in the list" is a strong hint
+                            s.added = *seen.entry(s.id.clone()).or_insert(now);
+                            add.push(s);
+                        }
                         drop(st);
-                        self.add_new(list);
+                        fresh.extend(add);
                     }
                     Err(e) => {
                         let mut st = self.st.lock().unwrap();
@@ -1722,8 +1747,10 @@ impl Engine {
             };
             let plan = {
                 let st = self.st.lock().unwrap();
-                let cands: Vec<Server> = st.servers.iter().filter(|s| tier_ids.contains(&s.source) && !busy.contains(&s.id)).cloned().collect();
-                scan::plan(&cands, &srcs, &st.stats, if full { 1500 } else { 700 }, util::now(), &prefer)
+                let mut cands: Vec<Server> = st.servers.iter().filter(|s| tier_ids.contains(&s.source) && !busy.contains(&s.id)).cloned().collect();
+                cands.append(&mut fresh);
+                let hints = scan::Hints::learn(&st.servers, util::now());
+                scan::plan(&cands, &srcs, &st.stats, if full { 1500 } else { 700 }, util::now(), &prefer, &hints)
             };
             let need = if full { 0 } else { target.saturating_sub(good_free()).max(1) };
             let opts = scan::Opts { target_good: need, ..base.clone() };
@@ -1733,6 +1760,11 @@ impl Engine {
             if self.connected() {
                 self.apply_pool().await;
             }
+        }
+        {
+            let now = util::now();
+            seen.retain(|_, t| now.saturating_sub(*t) < 14 * 86400);
+            let _ = store::save(&seen_file, &seen);
         }
         // 4b. entry hops: servers that do not answer from here (port closed, no reply)
         // often work through a server that does — the path to them is what is blocked

@@ -102,7 +102,8 @@ pub fn proto_rank(s: &Server) -> u8 {
     let net = p.get("network").and_then(|v| v.as_str()).unwrap_or("tcp");
     match s.proto {
         Proto::Vless if reality => 0,
-        Proto::Vless if tls && net == "xhttp" => 1,
+        // in 2026 Russia, XHTTP and gRPC outlive plain TCP the longest
+        Proto::Vless if tls && (net == "xhttp" || net == "grpc") => 1,
         Proto::Hysteria2 | Proto::Anytls | Proto::Tuic | Proto::Awg => 1,
         Proto::Trojan => 2,
         Proto::Vless if tls => 2,
@@ -197,6 +198,93 @@ pub fn cooldown(s: &Server) -> u64 {
     if s.oks > 0 { c / 2 } else { c }
 }
 
+/// What the database has learned about where working servers live: per /24 (IPv6: /48)
+/// network and per TLS server name, how many recently checked servers worked and how
+/// many failed. Hosters and camouflage names that the censor lets through tend to keep
+/// working for everyone on them; networks that are blocked tend to be blocked whole.
+#[derive(Default, Debug)]
+pub struct Hints {
+    net: HashMap<String, (u32, u32)>,
+    sni: HashMap<String, (u32, u32)>,
+}
+
+fn net_key(host: &str) -> Option<String> {
+    match host.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>().ok()? {
+        IpAddr::V4(v) => {
+            let o = v.octets();
+            Some(format!("{}.{}.{}", o[0], o[1], o[2]))
+        }
+        IpAddr::V6(v) => {
+            let g = v.segments();
+            Some(format!("{:x}:{:x}:{:x}", g[0], g[1], g[2]))
+        }
+    }
+}
+
+fn sni_key(s: &Server) -> Option<String> {
+    let p = &s.proxy;
+    p.get("servername").or_else(|| p.get("sni")).and_then(|v| v.as_str()).map(|v| v.trim().to_ascii_lowercase()).filter(|v| !v.is_empty())
+}
+
+impl Hints {
+    /// Learns from servers checked in the last two days (the censor's lists move).
+    pub fn learn(all: &[Server], now: u64) -> Hints {
+        let mut h = Hints::default();
+        for s in all {
+            let Some(p) = s.probe.as_ref() else { continue };
+            if now.saturating_sub(p.at) > 2 * 86400 || s.relay.is_some() {
+                continue;
+            }
+            let ok = p.ok;
+            // only failures that say something about the path, not about our lab
+            if !ok && !p.error.as_deref().is_some_and(|e| e.starts_with("не отвечает") || e.starts_with("порт закрыт") || e.starts_with("таймаут")) {
+                continue;
+            }
+            let add = |m: &mut HashMap<String, (u32, u32)>, k: String| {
+                let e = m.entry(k).or_default();
+                if ok { e.0 += 1 } else { e.1 += 1 }
+            };
+            if let Some(k) = net_key(&s.host) {
+                add(&mut h.net, k);
+            }
+            if let Some(k) = sni_key(s) {
+                add(&mut h.sni, k);
+            }
+        }
+        h
+    }
+
+    /// 0 = a neighbour works, 1 = nothing known, 2 = the neighbourhood is consistently dead.
+    pub fn class(&self, s: &Server) -> u8 {
+        let net = net_key(&s.host).and_then(|k| self.net.get(&k)).copied().unwrap_or_default();
+        let sni = sni_key(s).and_then(|k| self.sni.get(&k)).copied().unwrap_or_default();
+        if net.0 > 0 || (sni.0 >= 2 && sni.0 * 8 >= sni.0 + sni.1) {
+            0
+        } else if net.1 >= 3 || (sni.1 >= 40 && sni.0 == 0) {
+            2
+        } else {
+            1
+        }
+    }
+}
+
+/// Per-scan cap of a source scaled by its record: lists that keep yielding nothing get
+/// fewer tests, productive ones more.
+pub fn effective_cap(d: &SourceDef, st: Option<&SourceStat>) -> usize {
+    let Some(st) = st.filter(|s| s.tested >= 150) else { return d.cap };
+    let r = st.good as f64 / st.tested as f64;
+    let k = if r >= 0.05 {
+        2.0
+    } else if r >= 0.02 {
+        1.4
+    } else if r < 0.003 {
+        0.35
+    } else {
+        1.0
+    };
+    ((d.cap as f64 * k) as usize).max(30)
+}
+
 /// Picks candidates to test, round-robin across sources (tier order, then source success),
 /// best protocols first, skipping recently failed and insecure ones. Candidates for which
 /// `prefer` holds (e.g. entry IP in the chosen countries) are all taken before the others.
@@ -207,6 +295,7 @@ pub fn plan(
     limit: usize,
     now: u64,
     prefer: &dyn Fn(&Server) -> bool,
+    hints: &Hints,
 ) -> Vec<Server> {
     let mut by_src: HashMap<&str, Vec<&Server>> = HashMap::new();
     for s in all {
@@ -234,11 +323,13 @@ pub fn plan(
         // previously good first, then protocol rank, then shuffle-ish by id
         // previously good first; then servers that appeared in the last day (fresh entries
         // of a list live longest and have not been blocked yet); then DPI resistance
+        // then servers next to working ones (same network or camouflage name), unknown
+        // neighbourhoods, and last those where everything around is dead
         v.sort_by_key(|s| {
             let fresh = now.saturating_sub(s.added) < 24 * 3600;
-            (if s.good() { 0 } else { 1 }, if fresh { 0 } else { 1 }, proto_rank(s), s.fails, std::cmp::Reverse(s.added), s.id.clone())
+            (if s.good() { 0 } else { 1 }, hints.class(s), if fresh { 0 } else { 1 }, proto_rank(s), s.fails, std::cmp::Reverse(s.added), s.id.clone())
         });
-        v.truncate(d.cap);
+        v.truncate(effective_cap(d, stats.get(&d.id)));
         let (a, b): (Vec<&Server>, Vec<&Server>) = v.into_iter().partition(|s| prefer(s));
         queues.push((d.tier, a.into_iter().collect()));
         later.push((d.tier, b.into_iter().collect()));
@@ -758,13 +849,16 @@ pub async fn check(env: &Env, list: Vec<Server>, o: &Opts, net: &mut NetInfo, mu
         // Suspiciously few answers: the test URL may be blocked or the machine overloaded.
         // Second chance through another URL and a longer timeout before anyone is blamed.
         let mut env_down = false;
-        if batch.len() >= 32 && alive.len() * 100 < batch.len() * 3 {
+        // Free servers are often slow to the first byte (an overloaded box, a long path):
+        // everyone who stayed silent gets a second try with another URL and a longer
+        // timeout. One extra round per batch finds noticeably more servers.
+        if alive.len() < batch.len() {
             env.stage("Повторная проверка");
             let again = lab.proc.api.group_delay("ALL", mihomo::ALT_TEST_URL, o.delay_timeout_ms * 2).await;
             for (k, v) in again {
                 alive.entry(k).or_insert(v);
             }
-            if alive.len() * 100 < batch.len() {
+            if batch.len() >= 32 && alive.len() * 100 < batch.len() {
                 *net = netinfo(&lab.direct, env.geo.as_deref()).await;
                 env_down = net.direct_ip.is_none();
             }
@@ -1009,12 +1103,47 @@ mod tests {
     }
 
     #[test]
+    fn hints_learn_neighbourhoods() {
+        let now = 1_000_000;
+        let mut ok = srv("5.6.7.10", Origin::Free, Some((100, "NL")));
+        ok.probe.as_mut().unwrap().at = now;
+        let mut dead: Vec<Server> = (0..3)
+            .map(|i| {
+                let mut s = srv(&format!("9.9.9.{i}"), Origin::Free, None);
+                s.probe = Some(Probe { at: now, error: Some("не отвечает".into()), ..Default::default() });
+                s
+            })
+            .collect();
+        dead.push(ok);
+        let h = Hints::learn(&dead, now);
+        assert_eq!(h.class(&srv("5.6.7.99", Origin::Free, None)), 0);
+        assert_eq!(h.class(&srv("9.9.9.200", Origin::Free, None)), 2);
+        assert_eq!(h.class(&srv("1.2.3.4", Origin::Free, None)), 1);
+        // old knowledge is forgotten
+        assert_eq!(Hints::learn(&dead, now + 3 * 86400).class(&srv("9.9.9.200", Origin::Free, None)), 1);
+        // the neighbourhood decides the order inside a source
+        let src = SourceDef { id: "t".into(), name: "t".into(), tier: 1, cap: 100, urls: vec![], enabled: true };
+        let p = plan(&[srv("9.9.9.50", Origin::Free, None), srv("8.8.1.1", Origin::Free, None), srv("5.6.7.50", Origin::Free, None)], &[src], &HashMap::new(), 10, now, &|_| false, &h);
+        let hosts: Vec<&str> = p.iter().map(|s| s.host.as_str()).collect();
+        assert_eq!(hosts, ["5.6.7.50", "8.8.1.1", "9.9.9.50"]);
+    }
+
+    #[test]
+    fn caps_follow_record() {
+        let d = SourceDef { id: "t".into(), name: "t".into(), tier: 1, cap: 100, urls: vec![], enabled: true };
+        assert_eq!(effective_cap(&d, None), 100);
+        assert_eq!(effective_cap(&d, Some(&SourceStat { tested: 100, good: 0, ..Default::default() })), 100);
+        assert_eq!(effective_cap(&d, Some(&SourceStat { tested: 1000, good: 1, ..Default::default() })), 35);
+        assert_eq!(effective_cap(&d, Some(&SourceStat { tested: 1000, good: 80, ..Default::default() })), 200);
+    }
+
+    #[test]
     fn plan_prefers() {
         let a = srv("1.1.1.1", Origin::Free, None);
         let b = srv("2.2.2.2", Origin::Free, None);
         let c = srv("3.3.3.3", Origin::Free, None);
         let src = SourceDef { id: "t".into(), name: "t".into(), tier: 1, cap: 100, urls: vec![], enabled: true };
-        let p = plan(&[a, b, c], &[src], &HashMap::new(), 10, 100, &|s: &Server| s.host == "3.3.3.3");
+        let p = plan(&[a, b, c], &[src], &HashMap::new(), 10, 100, &|s: &Server| s.host == "3.3.3.3", &Hints::default());
         assert_eq!(p[0].host, "3.3.3.3");
         assert_eq!(p.len(), 3);
     }
@@ -1057,7 +1186,7 @@ mod tests {
         old.added = 1_000;
         new.added = 1_000_000;
         let src = SourceDef { id: "t".into(), name: "t".into(), tier: 1, cap: 100, urls: vec![], enabled: true };
-        let p = plan(&[old, new], &[src], &HashMap::new(), 10, 1_000_100, &|_| false);
+        let p = plan(&[old, new], &[src], &HashMap::new(), 10, 1_000_100, &|_| false, &Hints::default());
         assert_eq!(p[0].host, "2.2.2.2");
     }
 
