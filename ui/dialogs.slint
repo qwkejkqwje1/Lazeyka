@@ -1,0 +1,1470 @@
+import { Theme } from "theme.slint";
+import { Icon } from "icons.slint";
+import { App, ServerItem, CountryItem, TargetItem } from "state.slint";
+import { Modal, Btn, IconButton, Field, Toggle, Divider, Tag, Badge, OptionRow, Segmented, Clickable } from "widgets.slint";
+import { RouteBadge } from "routes.slint";
+import { ListView, TextEdit } from "std-widgets.slint";
+
+export component AddDialog inherits Modal {
+    title: "Добавить сервер";
+    close => { App.dialog = ""; }
+    Text {
+        text: "Вставьте ссылку (vless://, vmess://, trojan://, ss://, hy2://, tuic://, wireguard://), адрес подписки или содержимое файла: WireGuard / AmneziaWG .conf, OpenVPN .ovpn, Clash YAML, vpn:// из Amnezia.";
+        color: Theme.dim;
+        font-size: 12px;
+        wrap: word-wrap;
+    }
+    Rectangle {
+        height: 150px;
+        border-radius: 11px;
+        background: Theme.bg;
+        border-width: 1px;
+        border-color: Theme.line;
+        te := TextEdit {
+            width: 100%;
+            height: 100%;
+            text <=> App.import-text;
+            font-size: 12px;
+            wrap: char-wrap;
+            placeholder-text: "vless://… или https://… или [Interface]…";
+        }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        Btn {
+            text: "Вставить";
+            icon: "clipboard";
+            kind: 1;
+            clicked => { App.paste-clipboard(); }
+        }
+        Btn {
+            text: "Файл…";
+            icon: "folder";
+            kind: 1;
+            clicked => { App.import-file(); }
+        }
+        Rectangle { horizontal-stretch: 1; }
+        Btn {
+            text: App.busy ? "Добавляем…" : "Добавить";
+            kind: 0;
+            busy: App.busy;
+            enabled: App.import-text != "";
+            clicked => { App.import-text-submit(App.import-text); }
+        }
+    }
+}
+
+component InfoLine inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <color> tint: Theme.text;
+    HorizontalLayout {
+        padding-top: 4px;
+        padding-bottom: 4px;
+        spacing: 12px;
+        Text { text: root.label; color: Theme.dim; font-size: 12.5px; width: 100px; }
+        Text { text: root.value; color: root.tint; font-size: 12.5px; wrap: word-wrap; horizontal-stretch: 1; }
+    }
+}
+
+export component ServerDialog inherits Modal {
+    title: "Сервер";
+    max-h: 680px;
+    close => { App.dialog = ""; }
+    property <ServerItem> s: App.detail;
+    HorizontalLayout {
+        spacing: 11px;
+        Badge {
+            y: (parent.height - self.height) / 2;
+            cc: root.s.cc;
+            warp: root.s.warp;
+            dead: !root.s.ok && root.s.tested;
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            horizontal-stretch: 1;
+            Text { text: root.s.name; color: Theme.text; font-size: 14.5px; font-weight: 600; overflow: elide; }
+            Text {
+                text: root.s.warp ? "Cloudflare WARP" : root.s.country != "" ? root.s.country : "Страна выхода неизвестна";
+                color: Theme.dim;
+                font-size: 12px;
+                overflow: elide;
+            }
+        }
+        Rectangle {
+            y: (parent.height - self.height) / 2;
+            width: 36px;
+            height: 36px;
+            border-radius: 10px;
+            background: star-ta.has-hover ? Theme.card-hover : transparent;
+            Icon {
+                name: "star";
+                size: 20px;
+                thickness: 1.7px;
+                filled: root.s.fav;
+                color: root.s.fav ? Theme.warn : star-ta.has-hover ? Theme.text : Theme.dim;
+            }
+            star-ta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { App.set-favorite(root.s.id, !root.s.fav); }
+            }
+        }
+    }
+    Rectangle {
+        background: Theme.card;
+        border-radius: 12px;
+        VerticalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            padding-top: 6px;
+            padding-bottom: 6px;
+            InfoLine { label: "Протокол"; value: root.s.proto + (root.s.transport != "" ? " · " + root.s.transport : ""); }
+            if root.s.address != "": InfoLine { label: "Адрес"; value: root.s.address; }
+            InfoLine {
+                label: "Пинг";
+                value: root.s.ok ? root.s.latency + " мс" : root.s.tested ? "нет связи" : "не проверен";
+                tint: !root.s.ok ? Theme.faint : root.s.latency < 150 ? Theme.accent : root.s.latency < 350 ? Theme.warn : Theme.err;
+            }
+            InfoLine { label: "Скорость"; value: root.s.speed != "" ? root.s.speed : "не замерялась"; tint: root.s.speed != "" ? Theme.text : Theme.faint; }
+            InfoLine {
+                label: "Стабильность";
+                value: root.s.stability != "" ? root.s.stability + " · " + root.s.checks : root.s.checks != "" ? "мало данных · " + root.s.checks : "мало данных";
+                tint: root.s.stability != "" ? Theme.text : Theme.faint;
+            }
+            Rectangle {
+                HorizontalLayout {
+                    padding-top: 4px;
+                    padding-bottom: 4px;
+                    spacing: 12px;
+                    Text { text: "Сервисы"; color: Theme.dim; font-size: 12.5px; width: 100px; }
+                    HorizontalLayout {
+                        spacing: 5px;
+                        alignment: start;
+                        if root.s.yt: Tag { y: (parent.height - self.height) / 2; text: "YouTube"; tint: #ff6b6b; }
+                        if root.s.dc: Tag { y: (parent.height - self.height) / 2; text: "Discord"; tint: #8f9bff; }
+                        if root.s.tg: Tag { y: (parent.height - self.height) / 2; text: "Telegram"; tint: #4fb6ff; }
+                        if root.s.udp: Tag { y: (parent.height - self.height) / 2; text: "UDP"; tint: Theme.dim; }
+                        if !root.s.yt && !root.s.dc && !root.s.tg && !root.s.udp: Text {
+                            text: root.s.ok ? "—" : "не проверены";
+                            color: Theme.faint;
+                            font-size: 12.5px;
+                        }
+                    }
+                }
+            }
+            if root.s.checked != "": InfoLine { label: "Проверен"; value: root.s.checked; }
+            if root.s.error != "" && !root.s.ok: InfoLine { label: "Ошибка"; value: root.s.error; tint: Theme.err; }
+        }
+    }
+    if root.s.mine: VerticalLayout {
+        spacing: 6px;
+        Text { text: "Название"; color: Theme.dim; font-size: 12px; }
+        HorizontalLayout {
+            spacing: 8px;
+            name := Field {
+                text: App.edit-name;
+                placeholder: "Мой сервер";
+                accepted(t) => { App.rename-server(root.s.id, t); }
+            }
+            Btn {
+                text: "Сохранить";
+                kind: 1;
+                min-height: 40px;
+                enabled: name.text != "" && name.text != root.s.name;
+                clicked => { App.rename-server(root.s.id, name.text); }
+            }
+        }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        if root.s.mine: IconButton {
+            y: (parent.height - self.height) / 2;
+            width: 38px;
+            height: 38px;
+            icon: "trash";
+            tint: Theme.err;
+            clicked => { App.remove-server(root.s.id); }
+        }
+        Rectangle { horizontal-stretch: 1; }
+        Btn {
+            text: App.measuring ? "Замеряем…" : "Замерить";
+            icon: "gauge";
+            kind: 1;
+            busy: App.measuring;
+            clicked => { App.measure(root.s.id); }
+        }
+        Btn {
+            property <bool> live: root.s.selected && App.state == 2;
+            text: self.live ? "Подключено" : "Подключить";
+            icon: self.live ? "check" : "";
+            kind: 0;
+            enabled: !self.live;
+            clicked => {
+                App.select-server(root.s.id);
+                App.dialog = "";
+            }
+        }
+    }
+}
+
+export component SortDialog inherits Modal {
+    title: "Сортировка";
+    close => { App.dialog = ""; }
+    VerticalLayout {
+        spacing: 6px;
+        OptionRow {
+            title: "Лучшие";
+            subtitle: "Как в автовыборе: пинг, скорость и стабильность вместе";
+            checked: App.sort == 0;
+            clicked => { App.set-sort(0); App.dialog = ""; }
+        }
+        OptionRow {
+            title: "По пингу";
+            subtitle: "Сначала серверы с наименьшей задержкой";
+            checked: App.sort == 1;
+            clicked => { App.set-sort(1); App.dialog = ""; }
+        }
+        OptionRow {
+            title: "По скорости";
+            subtitle: "По последнему замеру скорости";
+            checked: App.sort == 2;
+            clicked => { App.set-sort(2); App.dialog = ""; }
+        }
+        OptionRow {
+            title: "По стабильности";
+            subtitle: "Доля успешных проверок за последнее время";
+            checked: App.sort == 3;
+            clicked => { App.set-sort(3); App.dialog = ""; }
+        }
+    }
+    Text {
+        text: "Избранные серверы (★) всегда показываются первыми.";
+        color: Theme.faint;
+        font-size: 11.5px;
+        wrap: word-wrap;
+    }
+}
+
+component CountryRow inherits Rectangle {
+    in property <CountryItem> item;
+    callback clicked;
+    height: 44px;
+    border-radius: 10px;
+    background: ta.has-hover ? Theme.card-hover : Theme.card;
+    border-width: item.on ? 1px : 0px;
+    border-color: Theme.accent.with-alpha(0.4);
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 12px;
+        spacing: 10px;
+        Badge {
+            y: (parent.height - self.height) / 2;
+            cc: root.item.cc;
+            width: 34px;
+            height: 26px;
+        }
+        Text {
+            text: root.item.name;
+            color: Theme.text;
+            font-size: 13.5px;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: root.item.count > 0 ? root.item.count + " раб." : "нет рабочих";
+            color: root.item.count > 0 ? Theme.dim : Theme.faint;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+        Rectangle {
+            width: 20px;
+            if root.item.on: Icon {
+                name: "check";
+                size: 18px;
+                color: Theme.accent;
+            }
+        }
+    }
+}
+
+export component CountriesDialog inherits Modal {
+    title: "Страны";
+    max-h: 680px;
+    close => { App.dialog = ""; }
+    Text {
+        text: "Автовыбор будет подключаться только к серверам выбранных стран (в том числе к избранным и вашим), а поиск проверит их в первую очередь. Если в этих странах не останется рабочих серверов, автовыбор временно возьмёт любой.";
+        color: Theme.dim;
+        font-size: 12px;
+        wrap: word-wrap;
+    }
+    OptionRow {
+        title: "Все страны";
+        subtitle: "Любой рабочий сервер";
+        checked: !App.countries-any;
+        clicked => { App.clear-countries(); }
+    }
+    Rectangle {
+        height: min(App.countries.length * 48px, 300px);
+        if App.countries.length > 0: ListView {
+            for c in App.countries: Rectangle {
+                height: 48px;
+                CountryRow {
+                    y: 2px;
+                    height: 44px;
+                    item: c;
+                    clicked => { App.toggle-country(c.cc); }
+                }
+            }
+        }
+    }
+    if App.countries.length == 0: Text {
+        text: "Страны появятся после первого поиска серверов.";
+        color: Theme.faint;
+        font-size: 12px;
+        wrap: word-wrap;
+    }
+    HorizontalLayout {
+        alignment: end;
+        Btn {
+            text: "Готово";
+            kind: 0;
+            clicked => { App.dialog = ""; }
+        }
+    }
+}
+
+export component LocationDialog inherits Modal {
+    title: "Папка программы";
+    close => { App.confirm-install(false); }
+    HorizontalLayout {
+        spacing: 10px;
+        Icon {
+            name: "alert";
+            size: 22px;
+            color: Theme.warn;
+        }
+        Text {
+            text: App.location-text;
+            color: Theme.text;
+            font-size: 12.5px;
+            wrap: word-wrap;
+            horizontal-stretch: 1;
+        }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: end;
+        if App.location-blocked: Btn {
+            text: "Понятно";
+            kind: 0;
+            clicked => { App.confirm-install(false); }
+        }
+        if !App.location-blocked: Btn {
+            text: "Отмена";
+            kind: 1;
+            clicked => { App.confirm-install(false); }
+        }
+        if !App.location-blocked: Btn {
+            text: "Продолжить";
+            kind: 0;
+            clicked => { App.confirm-install(true); }
+        }
+    }
+}
+
+export component AppsDialog inherits Modal {
+    title: "Запущенные программы";
+    max-h: 600px;
+    close => { App.dialog = ""; }
+    Field {
+        placeholder: "Поиск";
+        icon: "search";
+        edited(t) => { App.filter-processes(t); }
+    }
+    Rectangle {
+        height: 360px;
+        if App.processes.length == 0: Text {
+            text: "Список пуст";
+            color: Theme.faint;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        ListView {
+            for p in App.processes: Rectangle {
+                height: 40px;
+                Rectangle {
+                    y: 2px;
+                    height: 36px;
+                    border-radius: 9px;
+                    background: ta.has-hover ? Theme.card-hover : Theme.card;
+                    ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { App.route-add-entry(1, p); }
+                    }
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 8px;
+                        spacing: 10px;
+                        Icon { y: (parent.height - self.height) / 2; name: "app"; size: 15px; color: Theme.faint; }
+                        Text { text: p; color: Theme.text; font-size: 13px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                        Icon { y: (parent.height - self.height) / 2; name: "plus"; size: 16px; color: Theme.accent; }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component SourcesDialog inherits Modal {
+    title: "Источники серверов";
+    max-h: 640px;
+    close => { App.dialog = ""; }
+    Text {
+        text: "Лазейка регулярно загружает списки бесплатных серверов и проверяет каждый: доступность, страну выхода, YouTube, Discord, Telegram и UDP.";
+        color: Theme.dim;
+        font-size: 12px;
+        wrap: word-wrap;
+    }
+    Rectangle {
+        height: 330px;
+        ListView {
+            for s in App.sources: Rectangle {
+                height: 58px;
+                HorizontalLayout {
+                    padding-left: 4px;
+                    padding-right: 4px;
+                    spacing: 10px;
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Text { text: s.name; color: Theme.text; font-size: 13px; overflow: elide; vertical-alignment: center; }
+                            Tag { y: (parent.height - self.height) / 2; text: s.custom ? "СВОЙ" : "T" + s.tier; tint: s.custom ? Theme.link : Theme.dim; }
+                        }
+                        Text { text: s.stat; color: Theme.faint; font-size: 11px; overflow: elide; }
+                    }
+                    if s.custom: IconButton {
+                        y: (parent.height - self.height) / 2;
+                        icon: "trash";
+                        size: 15px;
+                        clicked => { App.remove-source(s.id); }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Toggle {
+                            checked: s.enabled;
+                            toggled(v) => { App.set-source(s.id, v); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        url := Field {
+            placeholder: "Свой список: https://…";
+            icon: "link";
+            accepted(t) => { App.add-source(t); url.clear(); }
+        }
+        IconButton {
+            y: (parent.height - self.height) / 2;
+            width: 40px;
+            height: 40px;
+            icon: "plus";
+            tint: Theme.accent;
+            clicked => { App.add-source(url.text); url.clear(); }
+        }
+    }
+}
+
+export component SubsDialog inherits Modal {
+    title: "Подписки";
+    close => { App.dialog = ""; }
+    if App.subs.length == 0: Text {
+        text: "Подписок нет. Добавьте ссылку на подписку через «Серверы → Добавить».";
+        color: Theme.dim;
+        font-size: 12.5px;
+        wrap: word-wrap;
+    }
+    for s in App.subs: HorizontalLayout {
+        spacing: 10px;
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            Text { text: s.name; color: Theme.text; font-size: 13px; overflow: elide; }
+            Text { text: s.info; color: s.error ? Theme.err : Theme.faint; font-size: 11px; overflow: elide; }
+        }
+        IconButton {
+            y: (parent.height - self.height) / 2;
+            icon: "trash";
+            size: 15px;
+            clicked => { App.remove-sub(s.id); }
+        }
+    }
+    if App.subs.length > 0: HorizontalLayout {
+        alignment: end;
+        Btn {
+            text: "Обновить все";
+            icon: "refresh";
+            kind: 1;
+            clicked => { App.refresh-subs(); }
+        }
+    }
+}
+
+export component LogDialog inherits Modal {
+    title: "Журнал";
+    max-h: 640px;
+    close => { App.dialog = ""; }
+    Rectangle {
+        height: 400px;
+        border-radius: 10px;
+        background: Theme.bg;
+        ListView {
+            for l in App.log-lines: Text {
+                text: l;
+                color: l.starts-with("---") ? Theme.accent : Theme.dim;
+                font-size: 11px;
+                wrap: word-wrap;
+                font-family: "Consolas";
+            }
+        }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        Btn {
+            text: "Обновить";
+            icon: "refresh";
+            kind: 2;
+            clicked => { App.open-dialog("log"); }
+        }
+        Rectangle { horizontal-stretch: 1; }
+        Btn {
+            text: "Копировать";
+            icon: "copy";
+            kind: 1;
+            clicked => { App.copy-log(); }
+        }
+    }
+}
+
+export component AboutDialog inherits Modal {
+    title: "О программе";
+    close => { App.dialog = ""; }
+    Text {
+        text: "Лазейка " + App.version + "\nЛёгкий VPN-клиент: свои серверы, бесплатные серверы с проверкой, Cloudflare WARP и раздельное туннелирование.";
+        color: Theme.text;
+        font-size: 13px;
+        wrap: word-wrap;
+    }
+    Text {
+        text: "Лицензия GPL-3.0-or-later. Ядро — mihomo (GPL-3.0). Геобаза — DB-IP Lite (CC BY 4.0, db-ip.com). Иконки по мотивам Feather (MIT).\nПрограмма не собирает и не отправляет никакой статистики.";
+        color: Theme.dim;
+        font-size: 12px;
+        wrap: word-wrap;
+    }
+    if App.home-dir != "": Text {
+        text: "Папка программы: " + App.home-dir + "\nВсе файлы и настройки Лазейки хранятся только в ней.";
+        color: Theme.dim;
+        font-size: 12px;
+        wrap: word-wrap;
+    }
+}
+
+export component UninstallDialog inherits Modal {
+    title: "Удалить Лазейку?";
+    close => { App.dialog = ""; }
+    Text {
+        text: "VPN будет отключён, служба и автозапуск удалены, а настройки и список серверов стёрты. Сами файлы программы останутся в папке" + (App.home-dir != "" ? " " + App.home-dir : "") + " — её можно удалить вручную. Windows попросит подтвердить действие.";
+        color: Theme.dim;
+        font-size: 12.5px;
+        wrap: word-wrap;
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: end;
+        Btn {
+            text: "Отмена";
+            kind: 1;
+            clicked => { App.dialog = ""; }
+        }
+        Btn {
+            text: "Удалить";
+            icon: "trash";
+            kind: 3;
+            clicked => { App.uninstall(); }
+        }
+    }
+}
+
+component TargetRow inherits Rectangle {
+    in property <TargetItem> item;
+    in property <bool> checked;
+    callback clicked;
+    height: 48px;
+    border-radius: 10px;
+    background: ta.has-hover ? Theme.card-hover : Theme.card;
+    border-width: checked ? 1px : 0px;
+    border-color: Theme.accent.with-alpha(0.4);
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 12px;
+        spacing: 10px;
+        Badge {
+            y: (parent.height - self.height) / 2;
+            cc: root.item.cc;
+            warp: root.item.warp;
+            dead: !root.item.ok;
+            width: 34px;
+            height: 26px;
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 1px;
+            horizontal-stretch: 1;
+            Text { text: root.item.title; color: root.item.ok ? Theme.text : Theme.dim; font-size: 13px; overflow: elide; }
+            Text { text: root.item.subtitle; color: Theme.dim; font-size: 11px; overflow: elide; }
+        }
+        Rectangle {
+            width: 20px;
+            if root.checked: Icon {
+                name: "check";
+                size: 18px;
+                color: Theme.accent;
+            }
+        }
+    }
+}
+
+// Direction of a route (new or existing): first the kind, then a country or a server.
+// Three separate modals instead of one dialog with step blocks: conditional blocks
+// made Slint undercount the panel height and clip the bottom note.
+export component TargetKindsDialog inherits Modal {
+    property <bool> edit: App.target-for != "";
+    property <bool> list-mode: App.target-for.starts-with("@list:");
+    property <string> kind: edit ? App.picker-kind : "";
+    title: edit ? "Направление" : "Новый маршрут";
+    max-h: 660px;
+    close => { App.dialog = ""; }
+    VerticalLayout {
+        spacing: 6px;
+        if !root.edit: Text {
+            text: "Куда направить сайты и программы этого маршрута?";
+            color: Theme.dim;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+        if root.list-mode: OptionRow {
+            title: "Не направлять отдельно";
+            subtitle: "Список работает только через маршруты, куда подключён";
+            checked: App.picker-target == "";
+            clicked => { App.pick-target(""); }
+        }
+        OptionRow {
+            title: "Напрямую";
+            subtitle: "Без VPN — например, банки, госуслуги, игры";
+            checked: root.kind == "direct";
+            clicked => { App.pick-target("direct"); }
+        }
+        OptionRow {
+            title: "Через VPN";
+            subtitle: "Тот же сервер, что на главной";
+            checked: root.kind == "vpn";
+            clicked => { App.pick-target("vpn"); }
+        }
+        OptionRow {
+            title: "Через страну…";
+            subtitle: "Лучшие рабочие серверы выбранной страны";
+            value: root.kind == "country" ? App.picker-cc : "";
+            checked: root.kind == "country";
+            clicked => { App.target-step = 1; }
+        }
+        OptionRow {
+            title: "Через сервер…";
+            subtitle: "Один сервер из вашего списка";
+            checked: root.kind == "server";
+            clicked => { App.target-step = 2; }
+        }
+        if App.has-chains: OptionRow {
+            title: "Через цепочку…";
+            subtitle: "Несколько серверов подряд, выход — через последний";
+            checked: root.kind == "chain";
+            clicked => { App.target-step = 3; }
+        }
+        OptionRow {
+            title: "Через WARP";
+            subtitle: "Cloudflare WARP";
+            checked: root.kind == "warp";
+            clicked => { App.pick-target("warp"); }
+        }
+        OptionRow {
+            title: "Блокировать";
+            subtitle: "Сайты не откроются, у программ не будет сети";
+            checked: root.kind == "block";
+            clicked => { App.pick-target("block"); }
+        }
+        Text {
+            text: "Если серверы маршрута перестанут отвечать, его трафик временно пойдёт через VPN — мимо VPN он не пойдёт.";
+            color: Theme.faint;
+            font-size: 11.5px;
+            wrap: word-wrap;
+        }
+    }
+}
+
+export component TargetCountryDialog inherits Modal {
+    property <bool> edit: App.target-for != "";
+    title: "Страна";
+    max-h: 660px;
+    close => { App.dialog = ""; }
+    VerticalLayout {
+        spacing: 8px;
+        Text {
+            text: "Маршрут будет использовать до пяти лучших рабочих серверов страны и переключаться между ними.";
+            color: Theme.dim;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+        Rectangle {
+            height: min(max(App.target-countries.length, 1) * 52px, 340px);
+            if App.target-countries.length == 0: Text {
+                text: "Рабочих серверов пока нет — они появятся после поиска.";
+                color: Theme.faint;
+                font-size: 12px;
+                wrap: word-wrap;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            if App.target-countries.length > 0: ListView {
+                for c in App.target-countries: Rectangle {
+                    height: 52px;
+                    TargetRow {
+                        y: 2px;
+                        item: c;
+                        checked: root.edit && App.picker-target == c.code;
+                        clicked => { App.pick-target(c.code); }
+                    }
+                }
+            }
+        }
+        HorizontalLayout {
+            alignment: start;
+            Btn {
+                text: "Назад";
+                icon: "chevron-left";
+                kind: 2;
+                min-height: 32px;
+                clicked => { App.target-step = 0; }
+            }
+        }
+    }
+}
+
+export component TargetServerDialog inherits Modal {
+    property <bool> edit: App.target-for != "";
+    title: "Сервер";
+    max-h: 660px;
+    close => { App.dialog = ""; }
+    VerticalLayout {
+        spacing: 8px;
+        Rectangle {
+            height: min(max(App.target-servers.length, 1) * 52px, 380px);
+            if App.target-servers.length == 0: Text {
+                text: "Список серверов пуст — добавьте свой сервер или запустите поиск.";
+                color: Theme.faint;
+                font-size: 12px;
+                wrap: word-wrap;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            if App.target-servers.length > 0: ListView {
+                for c in App.target-servers: Rectangle {
+                    height: 52px;
+                    TargetRow {
+                        y: 2px;
+                        item: c;
+                        checked: root.edit && App.picker-target == c.code;
+                        clicked => { App.pick-target(c.code); }
+                    }
+                }
+            }
+        }
+        Text {
+            text: "Бесплатные серверы живут недолго — для них надёжнее выбрать страну.";
+            color: Theme.faint;
+            font-size: 11.5px;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            alignment: start;
+            Btn {
+                text: "Назад";
+                icon: "chevron-left";
+                kind: 2;
+                min-height: 32px;
+                clicked => { App.target-step = 0; }
+            }
+        }
+    }
+}
+
+export component RouteNameDialog inherits Modal {
+    title: "Название маршрута";
+    close => { App.dialog = ""; }
+    f := Field {
+        text: App.edit-name;
+        placeholder: "Например: Банки";
+        accepted(t) => { App.route-rename(App.route.id, t); }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: end;
+        Btn {
+            text: "Отмена";
+            kind: 1;
+            clicked => { App.dialog = ""; }
+        }
+        Btn {
+            text: "Сохранить";
+            kind: 0;
+            clicked => { App.route-rename(App.route.id, f.text); }
+        }
+    }
+}
+
+export component RouteDeleteDialog inherits Modal {
+    title: "Удалить маршрут?";
+    close => { App.dialog = ""; }
+    Text {
+        text: "«" + App.route.name + "» (" + App.route.summary + ") будет удалён. Его сайты и программы пойдут как остальной трафик.";
+        color: Theme.text;
+        font-size: 12.5px;
+        wrap: word-wrap;
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: end;
+        Btn {
+            text: "Отмена";
+            kind: 1;
+            clicked => { App.dialog = ""; }
+        }
+        Btn {
+            text: "Удалить";
+            kind: 3;
+            clicked => { App.route-delete(App.route.id); }
+        }
+    }
+}
+
+export component TargetChainDialog inherits Modal {
+    property <bool> edit: App.target-for != "" && App.target-for != "@default";
+    title: "Цепочка";
+    max-h: 660px;
+    close => { App.dialog = ""; }
+    VerticalLayout {
+        spacing: 8px;
+        Rectangle {
+            height: min(max(App.target-chains.length, 1) * 52px, 380px);
+            if App.target-chains.length == 0: Text {
+                text: "Цепочек пока нет — создайте первую кнопкой «Цепочки» на странице маршрутов.";
+                color: Theme.faint;
+                font-size: 12px;
+                wrap: word-wrap;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            if App.target-chains.length > 0: ListView {
+                for c in App.target-chains: Rectangle {
+                    height: 52px;
+                    TargetRow {
+                        y: 2px;
+                        item: c;
+                        checked: root.edit && App.picker-target == c.code;
+                        clicked => { App.pick-target(c.code); }
+                    }
+                }
+            }
+        }
+        Text {
+            text: "Трафик идёт через звенья по очереди и выходит в интернет через последнее. Страна выхода — страна последнего звена.";
+            color: Theme.faint;
+            font-size: 11.5px;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            alignment: start;
+            Btn {
+                text: "Назад";
+                icon: "chevron-left";
+                kind: 2;
+                min-height: 32px;
+                clicked => { App.target-step = 0; }
+            }
+        }
+    }
+}
+
+// A row of the chains manager and the lists dialog: name, info, two actions.
+component ActionRow inherits Rectangle {
+    in property <string> title;
+    in property <string> info;
+    in property <bool> dim: false;
+    callback edit;
+    callback remove;
+    height: 52px;
+    Rectangle {
+        y: 2px;
+        height: 48px;
+        border-radius: 10px;
+        background: Theme.card;
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 6px;
+            spacing: 8px;
+            VerticalLayout {
+                alignment: center;
+                spacing: 1px;
+                horizontal-stretch: 1;
+                Text { text: root.title; color: root.dim ? Theme.dim : Theme.text; font-size: 13px; overflow: elide; }
+                Text { text: root.info; color: Theme.dim; font-size: 11px; overflow: elide; }
+            }
+            Btn {
+                text: "Изменить";
+                kind: 2;
+                min-height: 30px;
+                clicked => { root.edit(); }
+            }
+            IconButton {
+                y: (parent.height - self.height) / 2;
+                icon: "trash";
+                size: 16px;
+                clicked => { root.remove(); }
+            }
+        }
+    }
+}
+
+export component ChainsDialog inherits Modal {
+    title: "Цепочки";
+    max-h: 660px;
+    close => { App.dialog = ""; }
+    VerticalLayout {
+        spacing: 8px;
+        Text {
+            text: "Цепочка — до трёх звеньев подряд: сервер, страна или VPN. Её можно назначить маршруту или всему трафику по умолчанию.";
+            color: Theme.dim;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+        if App.target-chains.length == 0: Text {
+            text: "Цепочек пока нет.";
+            color: Theme.faint;
+            font-size: 12.5px;
+        }
+        Rectangle {
+            height: min(App.target-chains.length * 52px, 320px);
+            visible: App.target-chains.length > 0;
+            ListView {
+                for c in App.target-chains: ActionRow {
+                    title: c.title;
+                    info: c.subtitle;
+                    dim: !c.ok;
+                    edit => { App.chain-edit(c.code); }
+                    remove => { App.chain-delete(c.code); }
+                }
+            }
+        }
+        HorizontalLayout {
+            alignment: start;
+            Btn {
+                text: "Новая цепочка";
+                icon: "plus";
+                kind: 0;
+                min-height: 34px;
+                clicked => { App.chain-new(); }
+            }
+        }
+    }
+}
+
+export component ChainEditDialog inherits Modal {
+    title: "Цепочка";
+    max-h: 660px;
+    close => { App.dialog = "chains"; }
+    VerticalLayout {
+        spacing: 8px;
+        name := Field {
+            text <=> App.chain-name;
+            placeholder: "Название, например: Через Штаты";
+        }
+        if App.chain-hops.length == 0: Text {
+            text: "Добавьте от одного до трёх звеньев. Каждое следующее звено подключается через предыдущее.";
+            color: Theme.faint;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+        for h[i] in App.chain-hops: Rectangle {
+            height: 48px;
+            border-radius: 10px;
+            background: Theme.card;
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 6px;
+                spacing: 8px;
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 1px;
+                    horizontal-stretch: 1;
+                    Text { text: h.title; color: Theme.text; font-size: 13px; overflow: elide; }
+                    Text { text: h.subtitle; color: Theme.dim; font-size: 11px; }
+                }
+                Btn {
+                    text: "Изменить";
+                    kind: 2;
+                    min-height: 30px;
+                    clicked => { App.chain-hop-pick(i); }
+                }
+                IconButton {
+                    y: (parent.height - self.height) / 2;
+                    icon: "trash";
+                    size: 16px;
+                    clicked => { App.chain-hop-remove(i); }
+                }
+            }
+        }
+        if App.chain-hops.length < 3: HorizontalLayout {
+            alignment: start;
+            Btn {
+                text: "Добавить звено";
+                icon: "plus";
+                kind: 1;
+                min-height: 32px;
+                clicked => { App.chain-hop-add(); }
+            }
+        }
+        Text {
+            text: "Страна выхода — страна последнего звена. Если цепочка не соберётся, её трафик пойдёт через VPN.";
+            color: Theme.faint;
+            font-size: 11.5px;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            Btn {
+                text: "Отмена";
+                kind: 1;
+                clicked => { App.dialog = "chains"; }
+            }
+            Btn {
+                text: "Сохранить";
+                kind: 0;
+                enabled: App.chain-hops.length > 0;
+                clicked => { App.chain-save(); }
+            }
+        }
+    }
+}
+
+export component HopKindsDialog inherits Modal {
+    title: "Звено цепочки";
+    max-h: 660px;
+    close => { App.dialog = "chain-edit"; }
+    VerticalLayout {
+        spacing: 6px;
+        OptionRow {
+            title: "VPN";
+            subtitle: "Текущий сервер с главной страницы";
+            clicked => { App.pick-hop("vpn"); }
+        }
+        OptionRow {
+            title: "Страна…";
+            subtitle: "Лучшие рабочие серверы страны";
+            clicked => { App.hop-step = 1; }
+        }
+        OptionRow {
+            title: "Сервер…";
+            subtitle: "Один сервер из списка";
+            clicked => { App.hop-step = 2; }
+        }
+    }
+}
+
+export component HopCountryDialog inherits Modal {
+    title: "Страна звена";
+    max-h: 660px;
+    close => { App.dialog = "chain-edit"; }
+    VerticalLayout {
+        spacing: 8px;
+        Rectangle {
+            height: min(max(App.target-countries.length, 1) * 52px, 380px);
+            if App.target-countries.length == 0: Text {
+                text: "Нет стран с рабочими серверами.";
+                color: Theme.faint;
+                font-size: 12px;
+                wrap: word-wrap;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            if App.target-countries.length > 0: ListView {
+                for c in App.target-countries: Rectangle {
+                    height: 52px;
+                    TargetRow {
+                        y: 2px;
+                        item: c;
+                        clicked => { App.pick-hop(c.code); }
+                    }
+                }
+            }
+        }
+        HorizontalLayout {
+            alignment: start;
+            Btn {
+                text: "Назад";
+                icon: "chevron-left";
+                kind: 2;
+                min-height: 32px;
+                clicked => { App.hop-step = 0; }
+            }
+        }
+    }
+}
+
+export component HopServerDialog inherits Modal {
+    title: "Сервер звена";
+    max-h: 660px;
+    close => { App.dialog = "chain-edit"; }
+    VerticalLayout {
+        spacing: 8px;
+        Rectangle {
+            height: min(max(App.target-servers.length, 1) * 52px, 380px);
+            if App.target-servers.length == 0: Text {
+                text: "Список серверов пуст.";
+                color: Theme.faint;
+                font-size: 12px;
+                wrap: word-wrap;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            if App.target-servers.length > 0: ListView {
+                for c in App.target-servers: Rectangle {
+                    height: 52px;
+                    TargetRow {
+                        y: 2px;
+                        item: c;
+                        clicked => { App.pick-hop(c.code); }
+                    }
+                }
+            }
+        }
+        HorizontalLayout {
+            alignment: start;
+            Btn {
+                text: "Назад";
+                icon: "chevron-left";
+                kind: 2;
+                min-height: 32px;
+                clicked => { App.hop-step = 0; }
+            }
+        }
+    }
+}
+
+export component ListsDialog inherits Modal {
+    title: "Списки сайтов и программ";
+    max-h: 700px;
+    close => { App.dialog = ""; }
+    VerticalLayout {
+        spacing: 8px;
+        search := Field {
+            placeholder: "Поиск по всем спискам и маршрутам";
+            icon: "search";
+            text <=> App.list-search;
+            edited(t) => { App.search-lists(t); }
+        }
+        if App.list-search != "": Rectangle {
+            height: min(max(App.search-hits.length, 1) * 40px, 300px);
+            if App.search-hits.length == 0: Text {
+                text: "Ничего не нашлось.";
+                color: Theme.faint;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            if App.search-hits.length > 0: ListView {
+                for h in App.search-hits: Rectangle {
+                    height: 40px;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 8px;
+                        Text { text: h.text; color: Theme.text; font-size: 12.5px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                        Text { text: h.where; color: Theme.dim; font-size: 11px; vertical-alignment: center; }
+                    }
+                }
+            }
+        }
+        if App.list-search == "": VerticalLayout {
+            spacing: 8px;
+            Text {
+                text: "Список хранится один раз и подключается к маршрутам: изменили список — обновились все маршруты с ним.";
+                color: Theme.dim;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+            if App.lists.length == 0: Text {
+                text: "Списков пока нет — создайте первый, например «Банки» или «Работа».";
+                color: Theme.faint;
+                font-size: 12.5px;
+                wrap: word-wrap;
+            }
+            Rectangle {
+                height: min(App.lists.length * 52px, 320px);
+                visible: App.lists.length > 0;
+                ListView {
+                    for l in App.lists: ActionRow {
+                        title: l.name;
+                        info: l.info;
+                        edit => { App.list-edit(l.id); }
+                        remove => {
+                            App.edit-id = l.id;
+                            App.edit-name = l.name;
+                            App.dialog = "list-delete";
+                        }
+                    }
+                }
+            }
+            HorizontalLayout {
+                alignment: start;
+                Btn {
+                    text: "Новый список";
+                    icon: "plus";
+                    kind: 0;
+                    min-height: 34px;
+                    clicked => { App.list-new(); }
+                }
+            }
+        }
+    }
+}
+
+export component ListEditDialog inherits Modal {
+    property <[string]> list: App.list-tab == 0 ? App.sites : App.apps;
+    title: App.list-name;
+    max-h: 720px;
+    close => { App.dialog = "lists"; }
+    VerticalLayout {
+        spacing: 8px;
+        Clickable {
+            height: 56px;
+            clicked => {
+                App.target-for = "@list:" + App.list-id;
+                App.target-step = 0;
+                App.open-dialog("target");
+            }
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                spacing: 12px;
+                RouteBadge {
+                    y: (parent.height - self.height) / 2;
+                    kind: App.list-kind;
+                    cc: App.list-cc;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+                    Text { text: "Направление списка"; color: Theme.dim; font-size: 11.5px; }
+                    Text {
+                        text: App.list-target-label == "" ? "Не задано — только через маршруты" : App.list-target-label;
+                        color: Theme.text;
+                        font-size: 13.5px;
+                        font-weight: 600;
+                        overflow: elide;
+                    }
+                }
+                Icon { y: (parent.height - self.height) / 2; name: "chevron-right"; size: 16px; color: Theme.faint; }
+            }
+        }
+        Text {
+            text: "Своё направление забирает сайты и программы списка, которые не взял ни один маршрут выше.";
+            color: Theme.faint;
+            font-size: 11.5px;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            Btn {
+                text: "Переименовать";
+                kind: 2;
+                min-height: 30px;
+                clicked => {
+                    App.edit-id = App.list-id;
+                    App.edit-name = App.list-name;
+                    App.dialog = "list-name";
+                }
+            }
+        }
+        Segmented {
+            items: ["Сайты · " + App.sites.length, "Программы · " + App.apps.length];
+            current <=> App.list-tab;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            input := Field {
+                placeholder: App.list-tab == 0 ? "example.com или 10.0.0.0/8" : "program.exe";
+                icon: App.list-tab == 0 ? "globe" : "app";
+                accepted(t) => {
+                    if (t != "") {
+                        App.list-add-entry(App.list-tab, t);
+                        input.clear();
+                    }
+                }
+            }
+            IconButton {
+                y: (parent.height - self.height) / 2;
+                width: 40px;
+                height: 40px;
+                icon: "plus";
+                tint: Theme.accent;
+                clicked => {
+                    if (input.text != "") {
+                        App.list-add-entry(App.list-tab, input.text);
+                        input.clear();
+                    }
+                }
+            }
+        }
+        if root.list.length == 0: Text {
+            text: App.list-tab == 0 ? "Добавьте сайты в этот список." : "Добавьте программы в этот список.";
+            color: Theme.dim;
+            font-size: 12.5px;
+            wrap: word-wrap;
+        }
+        if root.list.length > 0: Rectangle {
+            height: min(root.list.length * 44px, 300px);
+            ListView {
+                for v in root.list: Rectangle {
+                    height: 44px;
+                    Rectangle {
+                        y: 2px;
+                        height: 40px;
+                        border-radius: 10px;
+                        background: Theme.card;
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 4px;
+                            spacing: 10px;
+                            Icon { y: (parent.height - self.height) / 2; name: App.list-tab == 0 ? "globe" : "app"; size: 16px; color: Theme.faint; }
+                            Text { text: v; color: Theme.text; font-size: 13px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                            IconButton {
+                                y: (parent.height - self.height) / 2;
+                                icon: "trash";
+                                size: 16px;
+                                clicked => { App.list-remove-entry(App.list-tab, v); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Text {
+            text: "Изменения сразу применяются ко всем маршрутам, где подключён этот список.";
+            color: Theme.faint;
+            font-size: 11.5px;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            Btn {
+                text: "Импорт";
+                icon: "download";
+                kind: 2;
+                min-height: 32px;
+                clicked => { App.list-import(App.list-tab); }
+            }
+            Btn {
+                text: "Экспорт";
+                icon: "upload";
+                kind: 2;
+                min-height: 32px;
+                enabled: root.list.length > 0;
+                clicked => { App.list-export(App.list-tab); }
+            }
+            Btn {
+                text: "Готово";
+                kind: 0;
+                min-height: 32px;
+                clicked => { App.dialog = "lists"; }
+            }
+        }
+    }
+}
+
+export component ListNameDialog inherits Modal {
+    title: "Название списка";
+    close => { App.dialog = "list-edit"; }
+    f := Field {
+        text: App.edit-name;
+        placeholder: "Например: Банки";
+        accepted(t) => { App.list-rename(App.edit-id, t); }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: end;
+        Btn {
+            text: "Отмена";
+            kind: 1;
+            clicked => { App.dialog = "list-edit"; }
+        }
+        Btn {
+            text: "Сохранить";
+            kind: 0;
+            clicked => { App.list-rename(App.edit-id, f.text); }
+        }
+    }
+}
+
+export component ListDeleteDialog inherits Modal {
+    title: "Удалить список?";
+    close => { App.dialog = "lists"; }
+    Text {
+        text: "«" + App.edit-name + "» будет удалён и отключён от всех маршрутов. Сами маршруты останутся.";
+        color: Theme.text;
+        font-size: 12.5px;
+        wrap: word-wrap;
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: end;
+        Btn {
+            text: "Отмена";
+            kind: 1;
+            clicked => { App.dialog = "lists"; }
+        }
+        Btn {
+            text: "Удалить";
+            kind: 3;
+            clicked => {
+                App.list-delete(App.edit-id);
+                App.dialog = "lists";
+            }
+        }
+    }
+}

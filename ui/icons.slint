@@ -1,0 +1,85 @@
+// Stroke icons on a 24×24 grid (shapes after Feather Icons, MIT).
+export global Icons {
+    pure public function path(name: string) -> string {
+        if (name == "power") { return "M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10"; }
+        if (name == "home") { return "M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2zM9 22V12h6v10"; }
+        if (name == "globe") { return "M22 12a10 10 0 1 1-20 0a10 10 0 1 1 20 0zM2 12h20M12 2a15.3 15.3 0 0 1 4 10a15.3 15.3 0 0 1-4 10a15.3 15.3 0 0 1-4-10a15.3 15.3 0 0 1 4-10z"; }
+        if (name == "split") { return "M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"; }
+        if (name == "sliders") { return "M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"; }
+        if (name == "plus") { return "M12 5v14M5 12h14"; }
+        if (name == "refresh") { return "M23 4v6h-6M20.49 15a9 9 0 1 1-2.12-9.36L23 10"; }
+        if (name == "search") { return "M19 11a8 8 0 1 1-16 0a8 8 0 1 1 16 0zM21 21l-4.35-4.35"; }
+        if (name == "trash") { return "M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"; }
+        if (name == "check") { return "M20 6L9 17l-5-5"; }
+        if (name == "x") { return "M18 6L6 18M6 6l12 12"; }
+        if (name == "chevron-right") { return "M9 18l6-6-6-6"; }
+        if (name == "chevron-left") { return "M15 18l-6-6 6-6"; }
+        if (name == "chevron-down") { return "M6 9l6 6 6-6"; }
+        if (name == "arrow-down") { return "M12 5v14M19 12l-7 7-7-7"; }
+        if (name == "arrow-up") { return "M12 19V5M5 12l7-7 7 7"; }
+        if (name == "zap") { return "M13 2L3 14h9l-1 8 10-12h-9l1-8z"; }
+        if (name == "shield") { return "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"; }
+        if (name == "clipboard") { return "M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2M9 2h6a1 1 0 0 1 1 1v2a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z"; }
+        if (name == "folder") { return "M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"; }
+        if (name == "app") { return "M4 3h16a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zM2 8h20M5.5 5.5h1M8.5 5.5h1"; }
+        if (name == "more") { return "M11.5 12h1M18.5 12h1M4.5 12h1"; }
+        if (name == "download") { return "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"; }
+        if (name == "upload") { return "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"; }
+        if (name == "link") { return "M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"; }
+        if (name == "edit") { return "M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"; }
+        if (name == "info") { return "M22 12a10 10 0 1 1-20 0a10 10 0 1 1 20 0zM12 16v-4M11.5 8h1"; }
+        if (name == "file") { return "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M16 13H8M16 17H8M10 9H8"; }
+        if (name == "cloud") { return "M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"; }
+        if (name == "list") { return "M8 6h13M8 12h13M8 18h13M2.5 6h1M2.5 12h1M2.5 18h1"; }
+        if (name == "radar") { return "M22 12a10 10 0 1 1-20 0a10 10 0 1 1 20 0zM18 12a6 6 0 1 1-12 0a6 6 0 1 1 12 0zM14 12a2 2 0 1 1-4 0a2 2 0 1 1 4 0z"; }
+        if (name == "alert") { return "M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M11.5 17h1"; }
+        if (name == "copy") { return "M11 9h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2zM5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"; }
+        if (name == "star") { return "M12 2.6l2.9 5.9 6.5.9-4.7 4.6 1.1 6.5L12 17.4l-5.8 3.1 1.1-6.5-4.7-4.6 6.5-.9z"; }
+        if (name == "sort") { return "M3 6h13M3 12h9M3 18h5M18 9V20M15 17l3 3 3-3"; }
+        if (name == "gauge") { return "M12 14l4-4M3.5 18a10 10 0 1 1 17 0"; }
+        if (name == "lock") { return "M5 11h14a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2zM7 11V7a5 5 0 0 1 10 0v4"; }
+        return "";
+    }
+}
+
+export component Icon inherits Path {
+    in property <string> name;
+    in property <color> color: #fff;
+    in property <length> size: 20px;
+    in property <length> thickness: 2px;
+    in property <bool> filled;
+    width: size;
+    height: size;
+    viewbox-width: 24;
+    viewbox-height: 24;
+    commands: Icons.path(name);
+    stroke: color;
+    stroke-width: thickness;
+    stroke-line-cap: round;
+    stroke-line-join: round;
+    fill: filled ? color : transparent;
+}
+
+// Brand mark: a shield with a keyhole-like gap ("лазейка").
+export component Logo inherits Rectangle {
+    in property <length> size: 28px;
+    in property <color> tint: #2fe0a3;
+    width: size;
+    height: size;
+    Path {
+        width: parent.width;
+        height: parent.height;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: "M12 1.8l8.2 3.1v6.6c0 5.4-3.6 9.2-8.2 10.9C7.4 20.7 3.8 16.9 3.8 11.5V4.9z";
+        fill: root.tint;
+    }
+    Path {
+        width: parent.width;
+        height: parent.height;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: "M12 7.2a2.4 2.4 0 0 1 1.3 4.4l.9 4.6h-4.4l.9-4.6A2.4 2.4 0 0 1 12 7.2z";
+        fill: #0d0f13;
+    }
+}

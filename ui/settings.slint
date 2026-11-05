@@ -1,0 +1,129 @@
+import { Theme } from "theme.slint";
+import { Icon } from "icons.slint";
+import { App } from "state.slint";
+import { Card, SettingRow, LinkRow, Divider, SectionTitle, Segmented } from "widgets.slint";
+import { ScrollView } from "std-widgets.slint";
+
+export component SettingsPage inherits Rectangle {
+    VerticalLayout {
+        padding-bottom: 6px;
+        spacing: 8px;
+        Text {
+            text: "Настройки";
+            color: Theme.text;
+            font-size: Theme.font-title;
+            font-weight: 700;
+            x: 18px;
+        }
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                padding-left: 14px;
+                padding-right: 14px;
+                padding-bottom: 12px;
+                spacing: 8px;
+                SectionTitle { text: "ОСНОВНЫЕ"; x: 4px; }
+                Card {
+                    VerticalLayout {
+                        SettingRow {
+                            title: "Запускать вместе с Windows";
+                            checked: App.autostart;
+                            toggled(v) => { App.set-flag("autostart", v); }
+                        }
+                        Divider { }
+                        SettingRow {
+                            title: "Подключаться автоматически";
+                            subtitle: "Включать VPN при запуске компьютера";
+                            checked: App.connect-on-start;
+                            toggled(v) => { App.set-flag("connect_on_start", v); }
+                        }
+                    }
+                }
+                SectionTitle { text: "СЕРВЕРЫ"; x: 4px; }
+                Card {
+                    VerticalLayout {
+                        SettingRow {
+                            title: "Cloudflare WARP";
+                            subtitle: "Запасной бесплатный сервер (AmneziaWG)";
+                            checked: App.warp;
+                            toggled(v) => { App.set-flag("warp", v); }
+                        }
+                        Divider { }
+                        LinkRow {
+                            title: "Источники серверов";
+                            subtitle: "Откуда брать бесплатные серверы";
+                            icon: "list";
+                            clicked => { App.open-dialog("sources"); }
+                        }
+                        Divider { }
+                        LinkRow {
+                            title: "Подписки";
+                            icon: "link";
+                            value: App.subs.length > 0 ? App.subs.length : "";
+                            clicked => { App.open-dialog("subs"); }
+                        }
+                    }
+                }
+                SectionTitle { text: "СЕТЬ"; x: 4px; }
+                Card {
+                    VerticalLayout {
+                        SettingRow {
+                            title: "Защита от утечек";
+                            subtitle: "Строгая маршрутизация: трафик не уйдёт мимо VPN";
+                            checked: App.strict-route;
+                            toggled(v) => { App.set-flag("strict_route", v); }
+                        }
+                        Divider { }
+                        SettingRow {
+                            title: "IPv6";
+                            subtitle: "Передавать IPv6-трафик через VPN";
+                            checked: App.ipv6;
+                            toggled(v) => { App.set-flag("ipv6", v); }
+                        }
+                        Divider { }
+                        VerticalLayout {
+                            padding: 14px;
+                            spacing: 8px;
+                            Text { text: "Сетевой стек"; color: Theme.text; font-size: Theme.font; }
+                            Segmented {
+                                items: ["gVisor", "Mixed", "System"];
+                                current: App.stack;
+                                changed(i) => { App.set-stack(i); }
+                            }
+                            Text {
+                                text: "gVisor работает везде и не требует правил брандмауэра. System быстрее, но может спросить разрешение брандмауэра.";
+                                color: Theme.dim;
+                                font-size: 11.5px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+                SectionTitle { text: "О ПРОГРАММЕ"; x: 4px; }
+                Card {
+                    VerticalLayout {
+                        LinkRow {
+                            title: "Журнал";
+                            icon: "file";
+                            clicked => { App.open-dialog("log"); }
+                        }
+                        Divider { }
+                        LinkRow {
+                            title: "Лазейка " + App.version;
+                            subtitle: (App.core-version != "" ? "Ядро mihomo " + App.core-version + " · " : "") + "GPL-3.0 · без телеметрии";
+                            icon: "shield";
+                            clicked => { App.open-dialog("about"); }
+                        }
+                        if App.can-uninstall: Divider { }
+                        if App.can-uninstall: LinkRow {
+                            title: "Удалить Лазейку";
+                            title-color: Theme.err;
+                            icon: "trash";
+                            clicked => { App.open-dialog("uninstall"); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

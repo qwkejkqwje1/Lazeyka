@@ -1,0 +1,276 @@
+export struct ServerItem {
+    id: string,
+    name: string,
+    cc: string,
+    country: string,
+    proto: string,
+    transport: string,
+    latency: int,
+    speed: string,
+    ok: bool,
+    tested: bool,
+    udp: bool,
+    yt: bool,
+    dc: bool,
+    tg: bool,
+    mine: bool,
+    warp: bool,
+    selected: bool,
+    in-pool: bool,
+    error: string,
+    fav: bool,
+    // "97%" or "" (not enough checks)
+    stability: string,
+    // "31 из 32 проверок"
+    checks: string,
+    // host:port
+    address: string,
+    // date of the last check
+    checked: string,
+}
+
+export struct CountryItem {
+    cc: string,
+    name: string,
+    count: int,
+    on: bool,
+}
+
+// A route: chosen sites and programs go their own way.
+export struct RouteItem {
+    id: string,
+    name: string,
+    enabled: bool,
+    // "direct", "vpn", "warp", "block", "country:DE", "server:<id>"
+    target: string,
+    // badge: "direct", "vpn", "warp", "block", "country", "server"
+    kind: string,
+    cc: string,
+    // "Через страну: Германия"
+    label: string,
+    // "3 сайта · 1 программа"
+    summary: string,
+    // why the route goes through the VPN for now ("" = fine)
+    warn: string,
+    first: bool,
+    last: bool,
+}
+
+// A choice in the direction picker (a country or a server).
+export struct TargetItem {
+    code: string,
+    title: string,
+    subtitle: string,
+    cc: string,
+    warp: bool,
+    ok: bool,
+}
+
+// A named entry list ("folder") in the route editor and the lists dialog.
+export struct ListItem {
+    id: string,
+    name: string,
+    // "3 сайта · 1 программа"
+    info: string,
+    // attached to the open route
+    on: bool,
+}
+
+// A search hit across folders and routes.
+export struct HitItem {
+    text: string,
+    where: string,
+}
+
+export struct SourceItem {
+    id: string,
+    name: string,
+    tier: int,
+    enabled: bool,
+    stat: string,
+    custom: bool,
+}
+
+export struct SubItem {
+    id: string,
+    name: string,
+    info: string,
+    error: bool,
+}
+
+export global App {
+    // flipped by ui.rs to force a complete redraw (see repaint layer in main.slint)
+    in-out property <bool> repaint;
+    // ---- connection (0 off, 1 connecting, 2 on, 3 error)
+    in property <int> state;
+    in property <string> state-text: "Отключено";
+    in property <string> message;
+    in property <string> timer;
+    // engine link: 0 ok, 1 not installed, 2 stopped/unreachable, 3 installing, 4 needs update
+    in property <int> service;
+    in property <string> service-text;
+    // current server
+    in property <string> cur-name: "Автовыбор";
+    in property <string> cur-cc;
+    in property <string> cur-detail: "Лучший из доступных серверов";
+    in property <bool> cur-warp;
+    in property <bool> auto: true;
+    in property <string> down;
+    in property <string> up;
+    in property <string> totals;
+    // search
+    in property <bool> scanning;
+    in property <float> scan-progress;
+    in property <string> scan-text;
+    in property <int> good-count;
+    in property <int> mine-count;
+    // servers page
+    in property <[ServerItem]> servers;
+    in-out property <int> filter;
+    in property <string> list-note;
+    // 0 best, 1 ping, 2 speed, 3 stability
+    in-out property <int> sort;
+    in property <[CountryItem]> countries;
+    in property <string> countries-text: "Все страны";
+    in property <bool> countries-any;
+    in property <string> auto-sub: "Лучший сервер, переключение при сбое";
+    in property <bool> auto-warn;
+    // server details dialog
+    in-out property <ServerItem> detail;
+    in property <bool> measuring;
+    // program folder (portable: everything lives there)
+    in property <string> home-dir;
+    // install warning about an unsafe folder (blocked: cannot install there at all)
+    in property <string> location-text;
+    in property <bool> location-blocked;
+    // routes: 0 — traffic without a route goes through the VPN, 1 — directly
+    in-out property <int> route-default;
+    in property <[RouteItem]> routes;
+    in property <int> routes-on;
+    in property <int> routes-spare;
+    // route editor (shown instead of the list while route-open)
+    in-out property <RouteItem> route;
+    in-out property <bool> route-open;
+    in property <[string]> sites;
+    in property <[string]> apps;
+    in-out property <int> list-tab;
+    // direction picker: step 0 kinds, 1 countries, 2 servers, 3 chains; target-for "" = a new route
+    in-out property <int> target-step;
+    in-out property <string> target-for;
+    in property <[TargetItem]> target-countries;
+    in property <[TargetItem]> target-servers;
+    in property <[TargetItem]> target-chains;
+    // name of the chain the default target uses ("" = plain VPN or direct)
+    in property <string> default-chain-name;
+    in property <bool> has-chains;
+    // chain editor draft (the name is edited in place, hops live in chain-hops)
+    in-out property <string> chain-name;
+    in property <[TargetItem]> chain-hops;
+    in-out property <int> hop-step;
+    // direction picker context (filled by ui.rs when the picker opens):
+    // the current target of whatever is being edited — a route, the default, a list
+    in-out property <string> picker-target;
+    in-out property <string> picker-kind;
+    in-out property <string> picker-cc;
+    // entry lists ("folders")
+    in property <[ListItem]> lists;
+    in-out property <string> list-id;
+    in-out property <string> list-name;
+    // the open list's own direction ("" target label = not set)
+    in property <string> list-kind;
+    in property <string> list-cc;
+    in property <string> list-target-label;
+    in-out property <string> list-search;
+    in property <[HitItem]> search-hits;
+    // settings
+    in property <bool> autostart;
+    in property <bool> connect-on-start;
+    in property <bool> warp: true;
+    in property <bool> strict-route: true;
+    in property <bool> ipv6: true;
+    in property <int> stack;
+    in property <string> version;
+    in property <string> core-version;
+    in property <[SourceItem]> sources;
+    in property <[SubItem]> subs;
+    in property <[string]> log-lines;
+    in property <[string]> processes;
+    in property <bool> can-uninstall;
+    // dialogs
+    in-out property <int> page;
+    in-out property <string> dialog;
+    in-out property <string> toast;
+    in-out property <string> import-text;
+    in property <bool> busy;
+    in-out property <string> edit-id;
+    in-out property <string> edit-name;
+
+    callback toggle-connect();
+    callback select-server(string);
+    callback scan();
+    callback cancel-scan();
+    callback import-text-submit(string);
+    callback paste-clipboard();
+    callback import-file();
+    callback remove-server(string);
+    callback rename-server(string, string);
+    callback set-route-default(int);
+    callback open-route(string);
+    callback new-route();
+    callback pick-target(string);
+    // chains
+    callback edit-chains();
+    callback chain-new();
+    callback chain-edit(string);
+    callback chain-delete(string);
+    callback chain-save();
+    callback chain-hop-add();
+    callback chain-hop-pick(int);
+    callback chain-hop-remove(int);
+    callback pick-hop(string);
+    callback open-default-chain();
+    callback clear-default-chain();
+    // entry lists ("folders")
+    callback lists-open();
+    callback list-new();
+    callback list-edit(string);
+    callback list-delete(string);
+    callback list-rename(string, string);
+    callback list-toggle(string, bool);
+    callback list-add-entry(int, string);
+    callback list-remove-entry(int, string);
+    callback list-import(int);
+    callback list-export(int);
+    callback search-lists(string);
+    callback route-toggle(string, bool);
+    callback route-move(string, int);
+    callback route-rename(string, string);
+    callback route-delete(string);
+    // kind 0 site, 1 program; for the open route
+    callback route-add-entry(int, string);
+    callback route-remove-entry(int, string);
+    callback route-import(int);
+    callback route-export(int);
+    callback load-processes();
+    callback filter-processes(string);
+    callback pick-exe();
+    callback set-flag(string, bool);
+    callback set-stack(int);
+    callback set-source(string, bool);
+    callback add-source(string);
+    callback remove-source(string);
+    callback refresh-subs();
+    callback remove-sub(string);
+    callback open-dialog(string);
+    callback copy-log();
+    callback uninstall();
+    callback page-changed(int);
+    callback service-action();
+    callback set-sort(int);
+    callback toggle-country(string);
+    callback clear-countries();
+    callback set-favorite(string, bool);
+    callback measure(string);
+    callback open-server(string);
+    callback confirm-install(bool);
+}

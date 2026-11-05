@@ -1,0 +1,265 @@
+import { Theme } from "theme.slint";
+import { Icon } from "icons.slint";
+import { App } from "state.slint";
+import { Clickable, Badge, Bar, Btn, IconButton } from "widgets.slint";
+
+component PowerButton inherits Rectangle {
+    in property <int> state;
+    callback clicked;
+    width: 188px;
+    height: 188px;
+    property <color> c: state == 2 ? Theme.accent : state == 1 ? Theme.warn : state == 3 ? Theme.err : Theme.idle;
+    property <bool> pulse;
+    Timer {
+        interval: 1100ms;
+        running: root.state == 1;
+        triggered => { root.pulse = !root.pulse; }
+    }
+    // soft halo
+    Rectangle {
+        width: 188px;
+        height: 188px;
+        border-radius: 94px;
+        background: root.c.with-alpha(root.state == 2 ? 0.10 : 0.045);
+        animate background { duration: 400ms; }
+    }
+    Rectangle {
+        width: 160px;
+        height: 160px;
+        border-radius: 80px;
+        background: root.c.with-alpha(root.state == 2 ? 0.14 : 0.06);
+        animate background { duration: 400ms; }
+    }
+    // expanding ring while connecting
+    if root.state == 1: Rectangle {
+        property <length> sz: root.pulse ? 188px : 136px;
+        width: sz;
+        height: sz;
+        border-radius: sz / 2;
+        border-width: 2px;
+        border-color: root.c.with-alpha(root.pulse ? 0.0 : 0.8);
+        animate width, height, border-color { duration: 1100ms; easing: ease-out; }
+    }
+    disk := Rectangle {
+        width: 132px;
+        height: 132px;
+        border-radius: 66px;
+        background: root.state == 2 ? (ta.has-hover ? Theme.accent.brighter(0.08) : Theme.accent) : ta.has-hover ? Theme.card-hover : Theme.card;
+        border-width: root.state == 2 ? 0px : 2px;
+        border-color: root.c.with-alpha(ta.has-hover ? 0.95 : 0.6);
+        drop-shadow-blur: root.state == 2 ? 28px : 14px;
+        drop-shadow-offset-y: 6px;
+        drop-shadow-color: root.state == 2 ? #2fe0a366 : #00000066;
+        animate border-color { duration: 200ms; }
+        Icon {
+            name: "power";
+            size: 50px;
+            thickness: 2.4px;
+            color: root.state == 2 ? Theme.on-accent : root.c.brighter(0.2);
+        }
+    }
+    ta := TouchArea {
+        x: disk.x;
+        y: disk.y;
+        width: disk.width;
+        height: disk.height;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component HomePage inherits Rectangle {
+    VerticalLayout {
+        padding-left: 18px;
+        padding-right: 18px;
+        padding-top: 4px;
+        padding-bottom: 14px;
+        spacing: 10px;
+        if App.service != 0: Rectangle {
+            height: note.preferred-height + 20px;
+            border-radius: 12px;
+            background: App.service == 3 ? Theme.accent.with-alpha(0.1) : Theme.warn.with-alpha(0.1);
+            border-width: 1px;
+            border-color: App.service == 3 ? Theme.accent.with-alpha(0.3) : Theme.warn.with-alpha(0.3);
+            HorizontalLayout {
+                padding: 10px;
+                spacing: 10px;
+                Icon {
+                    y: (parent.height - self.height) / 2;
+                    name: App.service == 3 ? "shield" : "info";
+                    size: 18px;
+                    color: App.service == 3 ? Theme.accent : Theme.warn;
+                }
+                note := Text {
+                    text: App.service-text;
+                    color: Theme.text;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                }
+                if App.service == 4 || App.service == 2: Btn {
+                    text: App.service == 4 ? "Обновить" : "Запустить";
+                    kind: 2;
+                    min-height: 30px;
+                    clicked => { App.service-action(); }
+                }
+            }
+        }
+        Rectangle { vertical-stretch: 1; min-height: 4px; }
+        HorizontalLayout {
+            alignment: center;
+            PowerButton {
+                state: App.state;
+                clicked => { App.toggle-connect(); }
+            }
+        }
+        VerticalLayout {
+            spacing: 4px;
+            Text {
+                text: App.state-text;
+                color: App.state == 2 ? Theme.accent : App.state == 3 ? Theme.err : Theme.text;
+                font-size: Theme.font-big;
+                font-weight: 700;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: App.state == 2 && App.message == "" ? App.timer : App.message;
+                color: Theme.dim;
+                font-size: 13px;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+                min-height: 18px;
+            }
+        }
+        Rectangle { vertical-stretch: 1; min-height: 4px; }
+        // traffic
+        if App.state == 2: HorizontalLayout {
+            spacing: 10px;
+            Rectangle {
+                height: 46px;
+                border-radius: 12px;
+                background: Theme.card;
+                HorizontalLayout {
+                    padding-left: 12px;
+                    spacing: 8px;
+                    Icon { y: (parent.height - self.height) / 2; name: "arrow-down"; size: 16px; color: Theme.accent; }
+                    VerticalLayout {
+                        alignment: center;
+                        Text { text: "Загрузка"; color: Theme.faint; font-size: 11px; }
+                        Text { text: App.down; color: Theme.text; font-size: 13px; font-weight: 600; }
+                    }
+                }
+            }
+            Rectangle {
+                height: 46px;
+                border-radius: 12px;
+                background: Theme.card;
+                HorizontalLayout {
+                    padding-left: 12px;
+                    spacing: 8px;
+                    Icon { y: (parent.height - self.height) / 2; name: "arrow-up"; size: 16px; color: Theme.link; }
+                    VerticalLayout {
+                        alignment: center;
+                        Text { text: "Отдача"; color: Theme.faint; font-size: 11px; }
+                        Text { text: App.up; color: Theme.text; font-size: 13px; font-weight: 600; }
+                    }
+                }
+            }
+        }
+        // current server
+        Clickable {
+            height: 66px;
+            clicked => { App.page = 1; App.page-changed(1); }
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 10px;
+                spacing: 12px;
+                Badge {
+                    y: (parent.height - self.height) / 2;
+                    cc: App.cur-cc;
+                    auto: App.auto && App.cur-cc == "" && !App.cur-warp;
+                    warp: App.cur-warp;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    Text {
+                        text: App.cur-name;
+                        color: Theme.text;
+                        font-size: Theme.font;
+                        font-weight: 600;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: App.cur-detail;
+                        color: Theme.dim;
+                        font-size: Theme.font-small;
+                        overflow: elide;
+                    }
+                }
+                Icon { y: (parent.height - self.height) / 2; name: "chevron-right"; size: 18px; color: Theme.faint; }
+            }
+        }
+        // routes summary
+        Clickable {
+            height: 52px;
+            clicked => { App.route-open = false; App.page = 2; App.page-changed(2); }
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 10px;
+                spacing: 12px;
+                Icon { y: (parent.height - self.height) / 2; name: App.routes-spare > 0 ? "alert" : "split"; size: 18px; color: App.routes-spare > 0 ? Theme.warn : Theme.dim; }
+                Text {
+                    text: App.routes-on == 0
+                        ? (App.route-default == 0 ? "Весь трафик через VPN" : "Весь трафик напрямую — маршрутов нет")
+                        : "Маршрутов: " + App.routes-on + (App.route-default == 0 ? " · остальное через VPN" : " · остальное напрямую")
+                            + (App.routes-spare > 0 ? " · " + App.routes-spare + " через запасной путь" : "");
+                    color: Theme.text;
+                    font-size: 13px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Icon { y: (parent.height - self.height) / 2; name: "chevron-right"; size: 18px; color: Theme.faint; }
+            }
+        }
+        // search progress
+        if App.scanning: Rectangle {
+            height: 54px;
+            border-radius: 12px;
+            background: Theme.card;
+            VerticalLayout {
+                padding-left: 14px;
+                padding-right: 6px;
+                padding-top: 8px;
+                padding-bottom: 10px;
+                spacing: 6px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: App.scan-text;
+                        color: Theme.dim;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    IconButton {
+                        width: 24px;
+                        height: 24px;
+                        icon: "x";
+                        size: 14px;
+                        clicked => { App.cancel-scan(); }
+                    }
+                }
+                Rectangle {
+                    height: 4px;
+                    Bar {
+                        x: 0;
+                        width: parent.width - 8px;
+                        value: App.scan-progress;
+                        indeterminate: App.scan-progress <= 0;
+                    }
+                }
+            }
+        }
+    }
+}

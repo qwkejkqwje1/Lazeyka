@@ -1,0 +1,468 @@
+import { Theme } from "theme.slint";
+import { Icon } from "icons.slint";
+import { App, RouteItem } from "state.slint";
+import { Clickable, Btn, IconButton, Segmented, Field, Toggle, SectionTitle, OptionRow } from "widgets.slint";
+import { ListView } from "std-widgets.slint";
+
+// Where a route goes: icon (or the country code) in the route's colour.
+export component RouteBadge inherits Rectangle {
+    in property <string> kind;
+    in property <string> cc;
+    in property <bool> dim;
+    property <color> tint: kind == "vpn" || kind == "server" || kind == "chain" ? Theme.accent : kind == "warp" ? #f6821f : kind == "block" ? Theme.err : kind == "country" ? Theme.text : Theme.dim;
+    width: 38px;
+    height: 30px;
+    border-radius: 8px;
+    background: kind == "country" ? Theme.card-hover : tint.with-alpha(0.14);
+    border-width: 1px;
+    border-color: kind == "country" ? Theme.line : tint.with-alpha(0.35);
+    opacity: dim ? 0.45 : 1;
+    if root.kind != "country": Icon {
+        name: root.kind == "direct" ? "split" : root.kind == "vpn" ? "shield" : root.kind == "warp" ? "cloud" : root.kind == "block" ? "x" : root.kind == "chain" ? "link" : "radar";
+        size: 16px;
+        color: root.tint;
+    }
+    if root.kind == "country": Text {
+        text: root.cc;
+        font-size: 12px;
+        font-weight: 700;
+        color: Theme.text;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component RouteCard inherits Clickable {
+    in property <RouteItem> item;
+    height: lay.preferred-height;
+    lay := HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 12px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: 12px;
+        RouteBadge {
+            y: (parent.height - self.height) / 2;
+            kind: root.item.kind;
+            cc: root.item.cc;
+            dim: !root.item.enabled;
+        }
+        VerticalLayout {
+            spacing: 2px;
+            alignment: center;
+            horizontal-stretch: 1;
+            Text {
+                text: root.item.name;
+                color: root.item.enabled ? Theme.text : Theme.dim;
+                font-size: 13.5px;
+                font-weight: 600;
+                overflow: elide;
+            }
+            Text {
+                text: root.item.label + " · " + root.item.summary;
+                color: Theme.dim;
+                font-size: 11.5px;
+                overflow: elide;
+            }
+            if root.item.warn != "" && root.item.enabled: Text {
+                text: root.item.warn;
+                color: Theme.warn;
+                font-size: 11.5px;
+                wrap: word-wrap;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Toggle {
+                checked: root.item.enabled;
+                toggled(v) => { App.route-toggle(root.item.id, v); }
+            }
+        }
+    }
+}
+
+component RouteList inherits VerticalLayout {
+    padding-left: 14px;
+    padding-right: 14px;
+    padding-bottom: 10px;
+    spacing: 10px;
+    Text {
+        text: "Маршруты";
+        color: Theme.text;
+        font-size: Theme.font-title;
+        font-weight: 700;
+        x: 4px;
+    }
+    Rectangle {
+        background: Theme.card;
+        border-radius: Theme.radius;
+        height: dl.preferred-height;
+        dl := VerticalLayout {
+            padding: 12px;
+            spacing: 8px;
+            Text {
+                text: "Остальной трафик";
+                color: Theme.text;
+                font-size: 13.5px;
+                font-weight: 600;
+            }
+            Segmented {
+                items: ["Через VPN", "Напрямую"];
+                current <=> App.route-default;
+                changed(i) => { App.set-route-default(i); }
+            }
+            Text {
+                text: App.route-default == 0
+                    ? "Всё, что не попало в маршруты, идёт через VPN."
+                    : "Всё, что не попало в маршруты, идёт напрямую — VPN работает только для маршрутов.";
+                color: Theme.dim;
+                font-size: 11.5px;
+                wrap: word-wrap;
+            }
+            if App.default-chain-name != "": HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: "Сейчас всё остальное идёт через цепочку «" + App.default-chain-name + "».";
+                    color: Theme.dim;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+                Btn {
+                    text: "Сбросить";
+                    kind: 2;
+                    min-height: 30px;
+                    clicked => { App.clear-default-chain(); }
+                }
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                if App.has-chains: Btn {
+                    text: "Цепочка по умолчанию…";
+                    kind: 1;
+                    min-height: 32px;
+                    clicked => { App.open-default-chain(); }
+                }
+                Btn {
+                    text: "Цепочки";
+                    kind: 1;
+                    min-height: 32px;
+                    clicked => { App.edit-chains(); }
+                }
+                Btn {
+                    text: "Списки";
+                    kind: 1;
+                    min-height: 32px;
+                    clicked => { App.lists-open(); }
+                }
+            }
+        }
+    }
+    if App.routes.length > 0: SectionTitle {
+        text: "ВЕРХНИЕ МАРШРУТЫ ВАЖНЕЕ НИЖНИХ";
+        x: 4px;
+        overflow: elide;
+    }
+    if App.routes.length > 0: ListView {
+        vertical-stretch: 1;
+        for r in App.routes: Rectangle {
+            height: card.height + 6px;
+            card := RouteCard {
+                y: 3px;
+                item: r;
+                clicked => { App.open-route(r.id); }
+            }
+        }
+    }
+    if App.routes.length == 0: VerticalLayout {
+        vertical-stretch: 1;
+        alignment: center;
+        spacing: 8px;
+        Icon {
+            name: "split";
+            size: 30px;
+            color: Theme.faint;
+        }
+        Text {
+            text: "Маршрут отправляет выбранные сайты и программы своим путём: напрямую, через серверы нужной страны, через конкретный сервер или WARP — или блокирует их.";
+            color: Theme.dim;
+            font-size: 12.5px;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+        Text {
+            text: "Например: банки — напрямую, YouTube — через Нидерланды, торрент-клиент — без VPN.";
+            color: Theme.faint;
+            font-size: 11.5px;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+    }
+    Btn {
+        text: "Новый маршрут";
+        icon: "plus";
+        kind: App.routes.length == 0 ? 0 : 1;
+        clicked => { App.new-route(); }
+    }
+}
+
+component RouteEditor inherits VerticalLayout {
+    property <[string]> list: App.list-tab == 0 ? App.sites : App.apps;
+    padding-left: 14px;
+    padding-right: 14px;
+    padding-bottom: 10px;
+    spacing: 10px;
+    HorizontalLayout {
+        height: 36px;
+        spacing: 4px;
+        IconButton {
+            y: (parent.height - self.height) / 2;
+            icon: "chevron-left";
+            size: 20px;
+            clicked => { App.route-open = false; }
+        }
+        Text {
+            text: App.route.name;
+            color: Theme.text;
+            font-size: 18px;
+            font-weight: 700;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        IconButton {
+            y: (parent.height - self.height) / 2;
+            icon: "edit";
+            size: 16px;
+            clicked => {
+                App.edit-name = App.route.name;
+                App.dialog = "route-name";
+            }
+        }
+        IconButton {
+            y: (parent.height - self.height) / 2;
+            icon: "trash";
+            size: 16px;
+            clicked => { App.dialog = "route-delete"; }
+        }
+    }
+    Clickable {
+        height: 56px;
+        clicked => {
+            App.target-for = App.route.id;
+            App.target-step = 0;
+            App.open-dialog("target");
+        }
+        HorizontalLayout {
+            padding-left: 10px;
+            padding-right: 10px;
+            spacing: 12px;
+            RouteBadge {
+                y: (parent.height - self.height) / 2;
+                kind: App.route.kind;
+                cc: App.route.cc;
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: 2px;
+                horizontal-stretch: 1;
+                Text { text: "Направление"; color: Theme.dim; font-size: 11.5px; }
+                Text { text: App.route.label; color: Theme.text; font-size: 13.5px; font-weight: 600; overflow: elide; }
+            }
+            Icon { y: (parent.height - self.height) / 2; name: "chevron-right"; size: 16px; color: Theme.faint; }
+        }
+    }
+    if App.route.warn != "" && App.route.enabled: HorizontalLayout {
+        spacing: 8px;
+        padding-left: 4px;
+        Icon { name: "alert"; size: 16px; color: Theme.warn; }
+        Text {
+            text: App.route.warn;
+            color: Theme.warn;
+            font-size: 12px;
+            wrap: word-wrap;
+            horizontal-stretch: 1;
+        }
+    }
+    HorizontalLayout {
+        height: 34px;
+        spacing: 10px;
+        padding-left: 4px;
+        Toggle {
+            y: (parent.height - self.height) / 2;
+            checked: App.route.enabled;
+            toggled(v) => { App.route-toggle(App.route.id, v); }
+        }
+        Text {
+            text: App.route.enabled ? "Маршрут включён" : "Маршрут выключен";
+            color: App.route.enabled ? Theme.text : Theme.dim;
+            font-size: 13px;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        IconButton {
+            y: (parent.height - self.height) / 2;
+            icon: "arrow-up";
+            size: 16px;
+            enabled: !App.route.first;
+            clicked => { App.route-move(App.route.id, -1); }
+        }
+        IconButton {
+            y: (parent.height - self.height) / 2;
+            icon: "arrow-down";
+            size: 16px;
+            enabled: !App.route.last;
+            clicked => { App.route-move(App.route.id, 1); }
+        }
+    }
+    VerticalLayout {
+        spacing: 4px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "Списки";
+                color: Theme.dim;
+                font-size: 11.5px;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Btn {
+                text: "Управлять списками";
+                kind: 2;
+                min-height: 28px;
+                clicked => { App.lists-open(); }
+            }
+        }
+        if App.lists.length == 0: Text {
+            text: "Общие списки сайтов и программ можно подключать к нескольким маршрутам сразу.";
+            color: Theme.faint;
+            font-size: 11.5px;
+            wrap: word-wrap;
+        }
+        for l in App.lists: OptionRow {
+            title: l.name;
+            subtitle: l.info;
+            checked: l.on;
+            clicked => { App.list-toggle(l.id, !l.on); }
+        }
+    }
+    Segmented {
+        items: ["Сайты · " + App.sites.length, "Программы · " + App.apps.length];
+        current <=> App.list-tab;
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        input := Field {
+            placeholder: App.list-tab == 0 ? "example.com или 10.0.0.0/8" : "program.exe";
+            icon: App.list-tab == 0 ? "globe" : "app";
+            accepted(t) => {
+                if (t != "") {
+                    App.route-add-entry(App.list-tab, t);
+                    input.clear();
+                }
+            }
+        }
+        IconButton {
+            y: (parent.height - self.height) / 2;
+            width: 40px;
+            height: 40px;
+            icon: "plus";
+            tint: Theme.accent;
+            clicked => {
+                if (input.text != "") {
+                    App.route-add-entry(App.list-tab, input.text);
+                    input.clear();
+                }
+            }
+        }
+    }
+    if App.list-tab == 1: HorizontalLayout {
+        spacing: 8px;
+        Btn {
+            text: "Запущенные программы";
+            icon: "list";
+            kind: 1;
+            min-height: 34px;
+            clicked => {
+                App.load-processes();
+                App.open-dialog("apps");
+            }
+        }
+        Btn {
+            text: "Обзор…";
+            icon: "folder";
+            kind: 1;
+            min-height: 34px;
+            clicked => { App.pick-exe(); }
+        }
+    }
+    if root.list.length == 0: VerticalLayout {
+        vertical-stretch: 1;
+        alignment: center;
+        spacing: 6px;
+        Text {
+            text: App.list-tab == 0 ? "Добавьте сайты этого маршрута." : "Добавьте программы этого маршрута.";
+            color: Theme.dim;
+            font-size: 12.5px;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+        Text {
+            text: App.list-tab == 0 ? "Поддомены учитываются автоматически: youtube.com включает www.youtube.com и m.youtube.com." : "Указывается имя файла программы, например telegram.exe.";
+            color: Theme.faint;
+            font-size: 11.5px;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+    }
+    if root.list.length > 0: ListView {
+        vertical-stretch: 1;
+        for v in root.list: Rectangle {
+            height: 44px;
+            Rectangle {
+                y: 2px;
+                height: 40px;
+                border-radius: 10px;
+                background: Theme.card;
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 4px;
+                    spacing: 10px;
+                    Icon { y: (parent.height - self.height) / 2; name: App.list-tab == 0 ? "globe" : "app"; size: 16px; color: Theme.faint; }
+                    Text { text: v; color: Theme.text; font-size: 13px; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                    IconButton {
+                        y: (parent.height - self.height) / 2;
+                        icon: "trash";
+                        size: 16px;
+                        clicked => { App.route-remove-entry(App.list-tab, v); }
+                    }
+                }
+            }
+        }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: end;
+        Btn {
+            text: "Импорт";
+            icon: "download";
+            kind: 2;
+            min-height: 32px;
+            clicked => { App.route-import(App.list-tab); }
+        }
+        Btn {
+            text: "Экспорт";
+            icon: "upload";
+            kind: 2;
+            min-height: 32px;
+            enabled: root.list.length > 0;
+            clicked => { App.route-export(App.list-tab); }
+        }
+    }
+}
+
+export component RoutesPage inherits Rectangle {
+    if !App.route-open: RouteList { }
+    if App.route-open: RouteEditor { }
+}

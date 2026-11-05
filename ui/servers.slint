@@ -1,0 +1,234 @@
+import { Theme } from "theme.slint";
+import { Icon } from "icons.slint";
+import { App, ServerItem } from "state.slint";
+import { Clickable, Badge, Tag, Btn, IconButton, Segmented, Pill } from "widgets.slint";
+import { ListView } from "std-widgets.slint";
+
+component ServerRow inherits Rectangle {
+    in property <ServerItem> item;
+    callback clicked;
+    callback more;
+    height: 60px;
+    border-radius: 12px;
+    background: item.selected ? Theme.accent.with-alpha(0.10) : ta.has-hover ? Theme.card-hover : Theme.card;
+    border-width: item.selected ? 1px : 0px;
+    border-color: Theme.accent.with-alpha(0.45);
+    animate background { duration: 100ms; }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    HorizontalLayout {
+        padding-left: 11px;
+        padding-right: 6px;
+        spacing: 11px;
+        Badge {
+            y: (parent.height - self.height) / 2;
+            cc: root.item.cc;
+            warp: root.item.warp;
+            dead: !root.item.ok && root.item.tested;
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 3px;
+            horizontal-stretch: 1;
+            HorizontalLayout {
+                spacing: 5px;
+                if root.item.fav: Icon {
+                    y: (parent.height - self.height) / 2;
+                    name: "star";
+                    size: 13px;
+                    thickness: 1.5px;
+                    filled: true;
+                    color: Theme.warn;
+                }
+                Text {
+                    text: root.item.name;
+                    color: Theme.text;
+                    font-size: 13.5px;
+                    font-weight: 600;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+            }
+            HorizontalLayout {
+                spacing: 5px;
+                Text {
+                    text: root.item.proto + (root.item.transport != "" ? " · " + root.item.transport : "");
+                    color: Theme.dim;
+                    font-size: 11.5px;
+                    overflow: elide;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                if root.item.yt: Tag { text: "YT"; tint: #ff6b6b; }
+                if root.item.dc: Tag { text: "DS"; tint: #8f9bff; }
+                if root.item.tg: Tag { text: "TG"; tint: #4fb6ff; }
+                if root.item.udp: Tag { text: "UDP"; tint: Theme.dim; }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            min-width: 54px;
+            Text {
+                text: root.item.ok ? root.item.latency + " мс" : root.item.tested ? "нет связи" : "не проверен";
+                color: !root.item.ok ? Theme.faint : root.item.latency < 150 ? Theme.accent : root.item.latency < 350 ? Theme.warn : Theme.err;
+                font-size: 12.5px;
+                font-weight: 600;
+                horizontal-alignment: right;
+            }
+            property <string> second: App.sort == 3 && root.item.stability != "" ? "стаб. " + root.item.stability : root.item.speed;
+            if second != "": Text {
+                text: second;
+                color: Theme.faint;
+                font-size: 11px;
+                horizontal-alignment: right;
+            }
+        }
+        IconButton {
+            y: (parent.height - self.height) / 2;
+            icon: "more";
+            size: 18px;
+            clicked => { root.more(); }
+        }
+    }
+}
+
+export component ServersPage inherits Rectangle {
+    VerticalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        padding-bottom: 10px;
+        spacing: 10px;
+        HorizontalLayout {
+            padding-left: 4px;
+            spacing: 6px;
+            Text {
+                text: "Серверы";
+                color: Theme.text;
+                font-size: Theme.font-title;
+                font-weight: 700;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Btn {
+                text: App.scanning ? "Стоп" : "Найти";
+                icon: App.scanning ? "x" : "radar";
+                kind: 1;
+                min-height: 34px;
+                clicked => {
+                    if (App.scanning) { App.cancel-scan(); } else { App.scan(); }
+                }
+            }
+            Btn {
+                text: "Добавить";
+                icon: "plus";
+                kind: 0;
+                min-height: 34px;
+                clicked => { App.open-dialog("add"); }
+            }
+        }
+        Segmented {
+            items: ["Все рабочие · " + App.good-count, "Мои · " + App.mine-count];
+            current <=> App.filter;
+            changed(i) => { App.page-changed(1); }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            Pill {
+                horizontal-stretch: 1;
+                icon: "sort";
+                text: App.sort == 1 ? "По пингу" : App.sort == 2 ? "По скорости" : App.sort == 3 ? "По стабильности" : "Лучшие";
+                clicked => { App.open-dialog("sort"); }
+            }
+            Pill {
+                horizontal-stretch: 1;
+                icon: "globe";
+                text: App.countries-text;
+                active: App.countries-any;
+                clicked => { App.open-dialog("countries"); }
+            }
+        }
+        // automatic choice
+        Rectangle {
+            height: 56px;
+            border-radius: 12px;
+            background: App.auto ? Theme.accent.with-alpha(0.10) : auto-ta.has-hover ? Theme.card-hover : Theme.card;
+            border-width: App.auto ? 1px : 0px;
+            border-color: Theme.accent.with-alpha(0.45);
+            auto-ta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { App.select-server(""); }
+            }
+            HorizontalLayout {
+                padding-left: 11px;
+                padding-right: 12px;
+                spacing: 11px;
+                Badge { y: (parent.height - self.height) / 2; auto: true; }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+                    Text { text: "Автовыбор"; color: Theme.text; font-size: 13.5px; font-weight: 600; }
+                    Text { text: App.auto-sub; color: App.auto-warn ? Theme.warn : Theme.dim; font-size: 11.5px; overflow: elide; }
+                }
+                if App.auto: Icon { y: (parent.height - self.height) / 2; name: "check"; size: 18px; color: Theme.accent; }
+            }
+        }
+        if App.filter == 1 && App.subs.length > 0: Clickable {
+            height: 44px;
+            clicked => { App.open-dialog("subs"); }
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 10px;
+                spacing: 10px;
+                Icon { y: (parent.height - self.height) / 2; name: "link"; size: 16px; color: Theme.dim; }
+                Text { text: "Подписки: " + App.subs.length; color: Theme.text; font-size: 13px; vertical-alignment: center; horizontal-stretch: 1; }
+                Icon { y: (parent.height - self.height) / 2; name: "chevron-right"; size: 16px; color: Theme.faint; }
+            }
+        }
+        if App.servers.length == 0: VerticalLayout {
+            vertical-stretch: 1;
+            alignment: center;
+            spacing: 8px;
+            padding: 20px;
+            Icon {
+                x: (parent.width - self.width) / 2;
+                name: App.filter == 1 ? "plus" : "radar";
+                size: 34px;
+                color: Theme.faint;
+            }
+            Text {
+                text: App.filter == 1
+                    ? "Здесь будут ваши серверы.\nНажмите «Добавить» и вставьте ссылку, подписку или файл конфигурации."
+                    : App.scanning ? "Ищем рабочие серверы…"
+                    : App.countries-any ? "В выбранных странах рабочих серверов пока нет.\nНажмите «Найти» или выберите другие страны."
+                    : "Рабочих серверов пока нет.\nНажмите «Найти» — Лазейка проверит бесплатные серверы.";
+                color: Theme.dim;
+                font-size: 13px;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+        }
+        if App.servers.length > 0: ListView {
+            vertical-stretch: 1;
+            for s in App.servers: Rectangle {
+                height: 64px;
+                ServerRow {
+                    y: 2px;
+                    height: 60px;
+                    item: s;
+                    clicked => { App.select-server(s.id); }
+                    more => { App.open-server(s.id); }
+                }
+            }
+        }
+        if App.list-note != "": Text {
+            text: App.list-note;
+            color: Theme.faint;
+            font-size: 11.5px;
+            horizontal-alignment: center;
+        }
+    }
+}
