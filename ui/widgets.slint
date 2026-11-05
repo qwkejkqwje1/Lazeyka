@@ -319,17 +319,36 @@ export component Field inherits Rectangle {
             color: Theme.faint;
         }
         Rectangle {
-            ti := TextInput {
+            // Clipboard shortcuts on non-Latin layouts: with a Russian/Ukrainian layout
+            // Ctrl+V arrives as "м", Ctrl+C as "с" and so on, which the built-in handling
+            // does not recognise. Also Shift+Insert / Ctrl+Insert / Shift+Delete.
+            fs := FocusScope {
                 width: 100%;
                 height: 100%;
-                color: Theme.text;
-                font-size: Theme.font;
-                vertical-alignment: center;
-                single-line: true;
-                selection-background-color: Theme.accent.with-alpha(0.35);
-                selection-foreground-color: Theme.text;
-                accepted => { root.accepted(self.text); }
-                edited => { root.edited(self.text); }
+                capture-key-pressed(e) => {
+                    if (e.modifiers.control && !e.modifiers.alt) {
+                        if (e.text == "м" || e.text == "М") { ti.paste(); return accept; }
+                        if (e.text == "с" || e.text == "С") { ti.copy(); return accept; }
+                        if (e.text == "ч" || e.text == "Ч") { ti.cut(); return accept; }
+                        if (e.text == "ф" || e.text == "Ф") { ti.select-all(); return accept; }
+                        if (e.text == "\u{f727}") { ti.copy(); return accept; }
+                    }
+                    if (e.modifiers.shift && !e.modifiers.control && e.text == "\u{f727}") { ti.paste(); return accept; }
+                    if (e.modifiers.shift && !e.modifiers.control && e.text == "\u{7f}") { ti.cut(); return accept; }
+                    reject
+                }
+                ti := TextInput {
+                    width: 100%;
+                    height: 100%;
+                    color: Theme.text;
+                    font-size: Theme.font;
+                    vertical-alignment: center;
+                    single-line: true;
+                    selection-background-color: Theme.accent.with-alpha(0.35);
+                    selection-foreground-color: Theme.text;
+                    accepted => { root.accepted(self.text); }
+                    edited => { root.edited(self.text); }
+                }
             }
             if ti.text == "": Text {
                 x: 0;

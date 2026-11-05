@@ -175,6 +175,17 @@ pub fn bg_recheck(s: &Server, now: u64) -> bool {
     }
 }
 
+/// How long a failing public server rests before it is tried again. Free servers flap
+/// (overloaded, rotated, rate-limited), so there is no long ban: the rest grows
+/// 20 min → 40 → 80 … capped at 6 h, and servers that worked at least once rest half as long.
+pub fn cooldown(s: &Server) -> u64 {
+    if s.fails < 2 {
+        return 0;
+    }
+    let c = ((20u64 * 60) << (s.fails - 2).min(5)).min(6 * 3600);
+    if s.oks > 0 { c / 2 } else { c }
+}
+
 /// Picks candidates to test, round-robin across sources (tier order, then source success),
 /// best protocols first, skipping recently failed and insecure ones. Candidates for which
 /// `prefer` holds (e.g. entry IP in the chosen countries) are all taken before the others.
@@ -192,10 +203,7 @@ pub fn plan(
             continue;
         }
         let recent = s.probe.as_ref().map(|p| now.saturating_sub(p.at)).unwrap_or(u64::MAX);
-        if s.fails >= 3 && recent < 6 * 3600 {
-            continue;
-        }
-        if s.fails >= 8 && recent < 48 * 3600 {
+        if recent < cooldown(s) {
             continue;
         }
         by_src.entry(s.source.as_str()).or_default().push(s);
@@ -392,7 +400,13 @@ fn test_local_exit(s: &Server) -> bool {
         && s.host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-fn finalize(s: &mut Server, mut p: Probe, trace: Option<probe::Trace>, net: &NetInfo, geo: Option<&Geo>) {
+fn finalize(s: &mut Server, p: Probe, trace: Option<probe::Trace>, net: &NetInfo, geo: Option<&Geo>) {
+    finalize_with(s, p, trace, net, geo, true)
+}
+
+/// `count` = false: the failure is not the server's fault (our network or lab was down),
+/// so neither its failure counter nor its stability history is touched.
+fn finalize_with(s: &mut Server, mut p: Probe, trace: Option<probe::Trace>, net: &NetInfo, geo: Option<&Geo>, count: bool) {
     if let Some(ip) = p.exit_ip.as_deref().and_then(|x| x.parse::<IpAddr>().ok()) {
         p.exit_cc = geo.and_then(|g| g.country(ip)).or_else(|| trace.as_ref().and_then(|t| t.loc.clone()));
         if p.ok && net.direct_ip == Some(ip) && !test_local_exit(s) {
@@ -412,10 +426,12 @@ fn finalize(s: &mut Server, mut p: Probe, trace: Option<probe::Trace>, net: &Net
         s.oks = s.oks.saturating_add(1);
         s.fails = 0;
         s.last_ok = p.at;
-    } else {
+    } else if count {
         s.fails = s.fails.saturating_add(1);
     }
-    s.record(p.ok);
+    if count || p.ok {
+        s.record(p.ok);
+    }
     // keep a previously measured speed for a day
     if p.speed.is_none() && p.ok {
         if let Some(old) = &s.probe {
@@ -481,7 +497,21 @@ pub async fn check(env: &Env, list: Vec<Server>, o: &Opts, net: &mut NetInfo, mu
         if net.direct_ip.is_none() || util::now().saturating_sub(net.at) > 600 {
             *net = netinfo(&lab.direct, env.geo.as_deref()).await;
         }
-        let alive = lab.proc.api.group_delay("ALL", mihomo::TEST_URL, o.delay_timeout_ms).await;
+        let mut alive = lab.proc.api.group_delay("ALL", mihomo::TEST_URL, o.delay_timeout_ms).await;
+        // Suspiciously few answers: the test URL may be blocked or the machine overloaded.
+        // Second chance through another URL and a longer timeout before anyone is blamed.
+        let mut env_down = false;
+        if batch.len() >= 32 && alive.len() * 100 < batch.len() * 3 {
+            env.stage("Повторная проверка");
+            let again = lab.proc.api.group_delay("ALL", mihomo::ALT_TEST_URL, o.delay_timeout_ms * 2).await;
+            for (k, v) in again {
+                alive.entry(k).or_insert(v);
+            }
+            if alive.len() * 100 < batch.len() {
+                *net = netinfo(&lab.direct, env.geo.as_deref()).await;
+                env_down = net.direct_ip.is_none();
+            }
+        }
         let sem = Arc::new(tokio::sync::Semaphore::new(o.parallel.max(1)));
         let mut js = tokio::task::JoinSet::new();
         let mut results: Vec<Option<(Probe, Option<probe::Trace>)>> = vec![None; batch.len()];
@@ -514,9 +544,13 @@ pub async fn check(env: &Env, list: Vec<Server>, o: &Opts, net: &mut NetInfo, mu
         }
         lab.proc.stop().await;
         let mut finished = Vec::new();
+        if env_down {
+            // no internet from the lab itself: results say nothing about the servers
+            env.progress.lock().unwrap().error = Some("нет доступа в интернет — проверка прервана, серверы не наказаны".into());
+        }
         for (mut s, r) in batch.into_iter().zip(results) {
             let Some((p, t)) = r else { continue };
-            finalize(&mut s, p, t, net, env.geo.as_deref());
+            finalize_with(&mut s, p, t, net, env.geo.as_deref(), !env_down);
             if s.good() && in_countries(&s, &o.want_cc) {
                 good_total += 1;
             }
@@ -528,7 +562,7 @@ pub async fn check(env: &Env, list: Vec<Server>, o: &Opts, net: &mut NetInfo, mu
         }
         on_batch(&finished);
         done.extend(finished);
-        if o.target_good > 0 && good_total >= o.target_good {
+        if env_down || (o.target_good > 0 && good_total >= o.target_good) {
             break;
         }
     }
@@ -689,6 +723,22 @@ mod tests {
         assert!(bg_recheck(&s, now)); // a day ago: one refresh is allowed
         let t = srv("plain", Origin::Free, Some((10, "US")));
         assert!(bg_recheck(&t, now)); // other protocols re-test freely
+    }
+
+    #[test]
+    fn cooldown_grows_and_caps() {
+        let mut s = srv("a", Origin::Free, None);
+        assert_eq!(cooldown(&s), 0);
+        s.fails = 1;
+        assert_eq!(cooldown(&s), 0);
+        s.fails = 2;
+        assert_eq!(cooldown(&s), 20 * 60);
+        s.fails = 3;
+        assert_eq!(cooldown(&s), 40 * 60);
+        s.fails = 100;
+        assert_eq!(cooldown(&s), 6 * 3600);
+        s.oks = 1;
+        assert_eq!(cooldown(&s), 3 * 3600);
     }
 
     #[test]
