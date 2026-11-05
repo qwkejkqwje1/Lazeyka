@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "lazeyka"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 description = "Лазейка — лёгкий VPN-клиент: сканер бесплатных серверов, раздельное туннелирование, AmneziaWG/WireGuard/VLESS/Hysteria2"
 license = "GPL-3.0-or-later"

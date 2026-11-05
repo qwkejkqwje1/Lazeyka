@@ -148,14 +148,24 @@ impl Engine {
         Ok(())
     }
 
-    /// Where the program package is unpacked: readable by the user who starts the
-    /// installer (the data folder is closed to everyone but the service).
+    /// Where the program package is unpacked: `<home>\update` next to lazeyka.exe — readable
+    /// by the user who starts the installer (the data folder is closed to everyone but the
+    /// service) and inside the program's own folder, so nothing is left elsewhere.
     fn package_dir(&self) -> PathBuf {
         if cfg!(windows) {
-            let base = std::env::var_os("ProgramData").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
-            base.join("Lazeyka-update")
+            self.paths.bin.join("update")
         } else {
             self.paths.data.join("update-pkg")
+        }
+    }
+
+    /// Removes the unpacked package of an earlier update (and the 0.6.0 location).
+    fn clean_package(&self) {
+        let _ = std::fs::remove_dir_all(self.package_dir());
+        if cfg!(windows) {
+            if let Some(pd) = std::env::var_os("ProgramData") {
+                let _ = std::fs::remove_dir_all(PathBuf::from(pd).join("Lazeyka-update"));
+            }
         }
     }
 
@@ -192,6 +202,9 @@ impl Engine {
     /// by itself when nothing else is running. The program is only announced.
     pub(super) async fn update_loop(self: Arc<Self>) {
         tokio::time::sleep(Duration::from_secs(120)).await;
+        if !self.st.lock().unwrap().update.busy {
+            self.clean_package();
+        }
         loop {
             let (auto, checked, failed) = {
                 let st = self.st.lock().unwrap();

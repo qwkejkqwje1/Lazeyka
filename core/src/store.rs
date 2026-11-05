@@ -6,7 +6,7 @@ use crate::sources::SourceDef;
 use crate::routes::Routes;
 use crate::split::Split;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -200,25 +200,42 @@ pub type Stats = HashMap<String, SourceStat>;
 /// corpses; the graveyard stops them from coming back (and being re-tested) for a while.
 pub type Grave = HashMap<String, u64>;
 
-/// A server that has not worked for this long (and keeps failing) is removed.
-pub const DEAD_AFTER: u64 = 14 * 86400;
+/// A server that has not worked — neither directly nor through an entry hop — for this
+/// long (and keeps failing) is removed.
+pub const DEAD_AFTER: u64 = 3 * 86400;
 /// Never-working servers get a shorter leash.
-pub const NEVER_AFTER: u64 = 7 * 86400;
+pub const NEVER_AFTER: u64 = 2 * 86400;
+/// Untested servers are only judged by age.
+pub const UNTESTED_AFTER: u64 = 7 * 86400;
+/// A server that the entry-hop scan has not looked at yet is spared for this long.
+const RELAY_GRACE: u64 = 7 * 86400;
 /// How long a buried server is refused when a source lists it again.
 pub const GRAVE_TTL: u64 = 21 * 86400;
 const GRAVE_MAX: usize = 40_000;
+/// Free (non-starred) servers kept in the database at most; the worst go first.
+pub const MAX_FREE: usize = 1500;
 
-/// Dead for weeks: it failed at least three checks in a row and has not worked within
-/// the period (or never worked since it was added a week ago). Untested ones are only
-/// judged by age. Favourites, own servers and WARP are never dead.
+/// Failed because the way to it is closed from here — the entry-hop scan may still revive it.
+fn unreachable_here(s: &Server) -> bool {
+    !crate::scan::is_udp_proto(s)
+        && s.probe.as_ref().is_some_and(|p| !p.ok && p.error.as_deref().is_some_and(|e| e.starts_with("порт закрыт") || e.starts_with("не отвечает")))
+}
+
+/// Dead: failed at least three checks in a row and has not worked (directly or through
+/// a hop) for three days — two if it never worked since it was added. A server that
+/// is unreachable from here is first given a try through an entry hop (up to a week).
+/// Untested ones are only judged by age. Favourites, own servers and WARP are never dead.
 pub fn is_dead(s: &Server, now: u64) -> bool {
     if s.origin != Origin::Free || s.fav {
         return false;
     }
     if s.probe.is_none() {
-        return now.saturating_sub(s.added) > DEAD_AFTER;
+        return now.saturating_sub(s.added) > UNTESTED_AFTER;
     }
     if s.fails < 3 || s.good() {
+        return false;
+    }
+    if s.relay_at == 0 && unreachable_here(s) && now.saturating_sub(s.added) < RELAY_GRACE {
         return false;
     }
     if s.last_ok > 0 {
@@ -228,8 +245,10 @@ pub fn is_dead(s: &Server, now: u64) -> bool {
     }
 }
 
-/// Drops free servers that are dead for weeks or stale (not seen working for a week and
-/// not checked for three days). Favourites are kept. Returns the removed ids.
+/// Drops free servers that are dead or stale (not seen working for a week and not checked
+/// for three days), then trims the database to `MAX_FREE` free servers: failing ones go
+/// first (the longest-failing first), untested ones next, working ones never. Favourites
+/// are kept. Returns the removed ids.
 pub fn prune(servers: &mut Vec<Server>, now: u64) -> Vec<String> {
     let mut gone = Vec::new();
     servers.retain(|s| {
@@ -245,6 +264,20 @@ pub fn prune(servers: &mut Vec<Server>, now: u64) -> Vec<String> {
         }
         keep
     });
+    let free = |s: &Server| s.origin == Origin::Free && !s.fav;
+    let n = servers.iter().filter(|s| free(s)).count();
+    if n > MAX_FREE {
+        // rank for removal: failing (0) before untested (1); within a class the oldest success first
+        let mut cand: Vec<(u8, u64, u64, String)> = servers
+            .iter()
+            .filter(|s| free(s) && !s.good())
+            .map(|s| (if s.probe.is_some() { 0 } else { 1 }, s.last_ok, s.added, s.id.clone()))
+            .collect();
+        cand.sort();
+        let drop: HashSet<String> = cand.into_iter().take(n - MAX_FREE).map(|c| c.3).collect();
+        servers.retain(|s| !drop.contains(&s.id));
+        gone.extend(drop);
+    }
     gone
 }
 
@@ -284,8 +317,8 @@ mod tests {
         let now = 100 * day;
         // keeps failing for weeks although it is "checked" every day
         let corpse = free(9, now - 30 * day, now - 60 * day, Some(now - 1000));
-        // worked 3 days ago: only flapping
-        let flaky = free(5, now - 3 * day, now - 60 * day, Some(now - 1000));
+        // worked 2 days ago: only flapping
+        let flaky = free(5, now - 2 * day, now - 60 * day, Some(now - 1000));
         // never worked, added 10 days ago
         let never = free(6, 0, now - 10 * day, Some(now - 1000));
         // never worked but added yesterday
@@ -303,12 +336,43 @@ mod tests {
         let gone = prune(&mut all, now);
         assert_eq!(gone, ["s0", "s2", "s4"]);
         assert_eq!(all.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), ["s1", "s3", "s5"]);
+        // unreachable from here and not yet tried through a hop: spared; tried: dead
+        let mut closed = free(5, now - 20 * day, now - 4 * day, Some(now - 1000));
+        closed.probe.as_mut().unwrap().error = Some("порт закрыт (TCP)".into());
+        assert!(!is_dead(&closed, now));
+        closed.relay_at = now - 100;
+        assert!(is_dead(&closed, now));
         let mut g = Grave::new();
         bury(&mut g, &gone, now);
         assert_eq!(g.len(), 3);
         // old graves expire
         bury(&mut g, &[], now + GRAVE_TTL + 1);
         assert!(g.is_empty());
+    }
+
+    #[test]
+    fn database_is_capped() {
+        let day = 86400;
+        let now = 100 * day;
+        let mut all: Vec<Server> = Vec::new();
+        for i in 0..(MAX_FREE + 100) {
+            // all failing but recently seen working, so only the cap removes them
+            let mut s = free(1, now - day - i as u64, now - 50 * day, Some(now - 1000));
+            s.id = format!("f{i}");
+            all.push(s);
+        }
+        let mut good = free(0, now - 10, now - 50 * day, Some(now - 10));
+        good.id = "good".into();
+        good.probe.as_mut().unwrap().ok = true;
+        good.probe.as_mut().unwrap().latency = Some(100);
+        all.push(good);
+        let gone = prune(&mut all, now);
+        assert_eq!(gone.len(), 101);
+        assert_eq!(all.len(), MAX_FREE);
+        assert!(all.iter().any(|s| s.id == "good"));
+        // the longest-failing (smallest last_ok) went first
+        assert!(gone.contains(&format!("f{}", MAX_FREE + 99)));
+        assert!(!all.iter().any(|s| s.id == format!("f{}", MAX_FREE + 99)));
     }
 
     #[test]

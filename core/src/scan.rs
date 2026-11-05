@@ -128,6 +128,9 @@ pub fn insecure(s: &Server) -> bool {
     }
 }
 
+/// Added to the score of servers that answer only through an entry hop.
+pub const RELAY_TIER: i64 = 100_000;
+
 /// Ranking score for AUTO order; lower is better. Non-working servers get i64::MAX.
 pub fn score(s: &Server) -> i64 {
     let Some(p) = s.probe.as_ref().filter(|p| p.ok) else { return i64::MAX };
@@ -148,9 +151,10 @@ pub fn score(s: &Server) -> i64 {
         sc -= (sp as i64 / 50).min(400);
     }
     sc += proto_rank(s) as i64 * 40;
-    // two hops: slower and one more thing that can break
+    // two hops: slower and one more thing that can break. A reserve tier: every
+    // direct server ranks above every relay one.
     if s.relay.is_some() {
-        sc += 150;
+        sc += RELAY_TIER;
     }
     sc -= (s.oks.min(20) as i64) * 5;
     // flaky servers sink: 75% of checks passed → +100
@@ -285,11 +289,22 @@ pub fn reasons(list: &[Server]) -> String {
     format!("рабочих {ok}; отказы: {}", if rest.is_empty() { "нет".to_string() } else { rest.join(", ") })
 }
 
-/// Working servers that can carry another server's connection: the best few of different
-/// hosts, no relay servers themselves, no WARP (its single key must not be shared).
-pub fn relay_hops(all: &[Server], n: usize) -> Vec<Server> {
-    let mut v: Vec<&Server> = all.iter().filter(|s| s.good() && s.relay.is_none() && s.origin != Origin::Warp && !insecure(s)).collect();
-    v.sort_by_key(|s| (score(s), s.id.clone()));
+/// Working servers that can carry another server's connection. Priority: the user's own
+/// and starred servers (a WireGuard / AmneziaWG of theirs included — if any of them works,
+/// only they are used), then Reality, then the rest by score. Different hosts, no relay
+/// servers themselves, no WARP (its single key must not be shared), no free WireGuard
+/// profiles (shared keys), nothing in `avoid` (keys that are already open elsewhere).
+pub fn relay_hops(all: &[Server], n: usize, avoid: &HashSet<String>) -> Vec<Server> {
+    let own = |s: &Server| s.origin == Origin::Mine || s.fav;
+    let wg = |s: &Server| matches!(s.proto, Proto::Wireguard | Proto::Awg);
+    let mut v: Vec<&Server> = all
+        .iter()
+        .filter(|s| s.good() && s.relay.is_none() && s.origin != Origin::Warp && !insecure(s) && !avoid.contains(&s.id) && (!wg(s) || own(s)))
+        .collect();
+    if v.iter().any(|s| own(s)) {
+        v.retain(|s| own(s));
+    }
+    v.sort_by_key(|s| (!own(s), proto_rank(s) != 0, score(s), s.id.clone()));
     let mut hosts = HashSet::new();
     v.into_iter().filter(|s| hosts.insert(s.host.clone())).take(n).cloned().collect()
 }
@@ -622,7 +637,7 @@ fn finalize_with(s: &mut Server, mut p: Probe, trace: Option<probe::Trace>, net:
     s.probe = Some(p);
 }
 
-fn is_udp_proto(s: &Server) -> bool {
+pub(crate) fn is_udp_proto(s: &Server) -> bool {
     matches!(s.proto, Proto::Hysteria2 | Proto::Tuic | Proto::Wireguard | Proto::Awg)
         || s.proxy.get("network").and_then(|v| v.as_str()).is_some_and(|n| n == "quic" || n == "kcp")
 }
@@ -960,7 +975,8 @@ mod tests {
         // the "tried" one comes back after the pause
         assert_eq!(relay_candidates(&all, 1700, 10, 600).len(), 2);
         // hops: good servers, one per host
-        let h = relay_hops(&all, 3);
+        let none = HashSet::new();
+        let h = relay_hops(&all, 3, &none);
         assert_eq!(h.len(), 1);
         assert_eq!(h[0].host, "1.1.1.1");
         // relay servers rank below the same server reached directly
@@ -969,6 +985,27 @@ mod tests {
         r.relay = Some("x".into());
         assert!(score(&r) > direct);
         assert_eq!(r.mihomo_proxy()["dialer-proxy"], "hop:x");
+        // a relay server ranks below even a slow direct one
+        let mut slow = srv("5.5.5.5", Origin::Free, Some((4000, "DE")));
+        slow.probe.as_mut().unwrap().services = 0;
+        assert!(score(&r) > score(&slow));
+        // avoid: keys already open elsewhere are not taken
+        let avoid: HashSet<String> = [good_a.id.clone()].into_iter().collect();
+        assert!(relay_hops(&all, 3, &avoid).is_empty());
+        // the user's own WireGuard beats everything while it works; free WireGuard is never a hop
+        let mut wg = srv("wg.example", Origin::Mine, Some((300, "NL")));
+        wg.proto = Proto::Wireguard;
+        let mut freewg = srv("freewg", Origin::Free, Some((10, "NL")));
+        freewg.proto = Proto::Wireguard;
+        let mut all2 = all.clone();
+        all2.push(freewg);
+        assert_eq!(relay_hops(&all2, 3, &none)[0].host, "1.1.1.1");
+        all2.push(wg.clone());
+        let h = relay_hops(&all2, 3, &none);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].host, "wg.example");
+        let avoid: HashSet<String> = [wg.id.clone()].into_iter().collect();
+        assert_eq!(relay_hops(&all2, 3, &avoid)[0].host, "1.1.1.1");
     }
 
     #[test]

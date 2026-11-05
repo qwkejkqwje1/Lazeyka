@@ -786,6 +786,10 @@ pub fn uninstall(args: &[String]) -> i32 {
         std::thread::sleep(Duration::from_millis(500));
     }
     let mut ok = !data.exists();
+    if ours {
+        // the unpacked package of an update (see Engine::package_dir)
+        let _ = std::fs::remove_dir_all(home.join("update"));
+    }
     if ours && foreign_entries(&home).is_empty() && !within(&home, &legacy_program_dir()) {
         ok &= unprotect_home(&home).is_ok();
     }

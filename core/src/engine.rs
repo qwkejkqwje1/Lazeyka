@@ -70,6 +70,9 @@ struct State {
     log: VecDeque<String>,
     /// Last event worth showing to the user (id grows with every notice).
     notice: (u64, String),
+    /// WARP variants are not re-tested before this time (unix seconds): none of them
+    /// worked, which in some countries is permanent (Cloudflare WARP is cut by DPI).
+    warp_retry: u64,
     /// Routes whose own servers do not answer: their traffic uses the VPN for now.
     route_spare: HashSet<String>,
     last_route_check: u64,
@@ -430,6 +433,9 @@ pub struct StatusView {
     pub update_mihomo: String,
 }
 
+/// How long WARP is left alone after none of its variants worked.
+const WARP_PAUSE: u64 = 6 * 3600;
+
 fn is_wg(s: &Server) -> bool {
     matches!(s.proto, Proto::Wireguard | Proto::Awg)
 }
@@ -462,6 +468,7 @@ impl Engine {
                 last_subs: util::now(),
                 log: VecDeque::new(),
                 notice: (0, String::new()),
+                warp_retry: 0,
                 route_spare: HashSet::new(),
                 last_route_check: 0,
                 update: update_ops::UpdateState::default(),
@@ -621,11 +628,31 @@ impl Engine {
             .collect()
     }
 
+    /// WireGuard-family servers that must not become lab hops now: with a live connection
+    /// their key is already open in the main mihomo (a second tunnel on the same key would
+    /// knock the session out).
+    fn relay_avoid(&self) -> HashSet<String> {
+        let mut out = self.busy_ids();
+        if !self.connected() {
+            return out;
+        }
+        let a = self.applied.lock().unwrap();
+        out.extend(a.pool.iter().chain(a.extra.iter()).cloned());
+        if let Some(o) = a.opts.as_ref() {
+            out.extend(o.hops.iter().map(|h| h.id.clone()));
+        }
+        drop(a);
+        let st = self.st.lock().unwrap();
+        out.retain(|id| st.servers.iter().any(|s| &s.id == id && is_wg(s)));
+        out
+    }
+
     /// `scan::check` that sends servers with an entry hop through `scan::check_relay`.
     async fn check_split(&self, env: &scan::Env, list: Vec<Server>, o: &scan::Opts, net: &mut NetInfo, count: bool) -> Vec<Server> {
         let (relay, direct): (Vec<Server>, Vec<Server>) = list.into_iter().partition(|s| s.relay.is_some());
         let mut out = if direct.is_empty() { Vec::new() } else { scan::check(env, direct, o, net, |b| self.merge_with(b, count)).await };
         if !relay.is_empty() && !env.cancel.load(Ordering::Relaxed) {
+            let avoid = self.relay_avoid();
             let hops = {
                 let st = self.st.lock().unwrap();
                 let mut hops: Vec<Server> = Vec::new();
@@ -636,7 +663,7 @@ impl Engine {
                         }
                     }
                 }
-                for h in scan::relay_hops(&st.servers, 3) {
+                for h in scan::relay_hops(&st.servers, 3, &avoid) {
                     if !hops.iter().any(|x| x.id == h.id) {
                         hops.push(h);
                     }
@@ -1092,9 +1119,11 @@ impl Engine {
         // a relay server whose hop is gone would make the whole configuration invalid
         let hop_ids: HashSet<String> = self.relay_hop_servers(&[pool, extra]).into_iter().map(|h| h.id).collect();
         let runnable = |s: &&Server| s.relay.as_ref().is_none_or(|r| hop_ids.contains(r));
-        let refs: Vec<&Server> = pool.iter().filter(runnable).collect();
+        // a WireGuard-family hop lives only as its config-level copy: one key, one tunnel
+        let not_hop = |s: &&Server| !(is_wg(s) && hop_ids.contains(&s.id));
+        let refs: Vec<&Server> = pool.iter().filter(runnable).filter(not_hop).collect();
         mihomo::write_atomic(&run.join("pool.yaml"), mihomo::pool_file(&refs).as_bytes()).map_err(|e| e.to_string())?;
-        let extra_ok: Vec<Server> = extra.iter().filter(|s| runnable(s)).cloned().collect();
+        let extra_ok: Vec<Server> = extra.iter().filter(|s| runnable(s) && not_hop(&s)).cloned().collect();
         self.write_extra(&extra_ok)?;
         let ids: Vec<String> = self.st.lock().unwrap().settings.routes.units().iter().map(|r| r.id.clone()).collect();
         self.write_route_lists(&ids)?;
@@ -1601,7 +1630,23 @@ impl Engine {
                     // all variants share one device key: while one of them works,
                     // testing the rest only fights its session — re-test when none works
                     if !w.is_empty() && !w.iter().any(|s| s.good()) {
-                        scan::check(&env, w, &base, &mut net, |b| self.merge(b)).await;
+                        let now = util::now();
+                        let paused = self.st.lock().unwrap().warp_retry > now;
+                        // nothing ever worked: not on every search, only every 6 hours (a search
+                        // started by the user always tests)
+                        if !paused || interactive {
+                            let res = scan::check(&env, w, &base, &mut net, |b| self.merge(b)).await;
+                            if !env.cancel.load(Ordering::Relaxed) && !res.is_empty() {
+                                let any = res.iter().any(|s| s.good());
+                                let first = self.st.lock().unwrap().warp_retry == 0;
+                                self.st.lock().unwrap().warp_retry = if any { 0 } else { now + WARP_PAUSE };
+                                if !any && first {
+                                    self.notice("WARP недоступен в вашей сети: ни один вариант не прошёл проверку. Повторю через 6 часов (кнопка поиска проверит сразу).");
+                                }
+                            }
+                        }
+                    } else {
+                        self.st.lock().unwrap().warp_retry = 0;
                     }
                 }
                 Err(e) => self.log(&e),
@@ -1644,7 +1689,7 @@ impl Engine {
                 let c = fc.clone();
                 let cache = self.paths.cache();
                 js.spawn(async move {
-                    let r = sources::fetch(&c, &d, &cache, 1800).await;
+                    let r = sources::fetch(&c, &d, &cache, 120).await;
                     (d, r)
                 });
             }
@@ -1696,9 +1741,10 @@ impl Engine {
                 let st = self.st.lock().unwrap();
                 !full && st.servers.iter().filter(|s| s.origin == Origin::Free && s.good() && scan::in_countries(s, &want)).count() >= target * 2
             };
+            let avoid = self.relay_avoid();
             let (hops, cands) = {
                 let st = self.st.lock().unwrap();
-                (scan::relay_hops(&st.servers, 3), scan::relay_candidates(&st.servers, util::now(), if full { 600 } else { 300 }, 12 * 3600))
+                (scan::relay_hops(&st.servers, 3, &avoid), scan::relay_candidates(&st.servers, util::now(), if full { 600 } else { 300 }, 12 * 3600))
             };
             if !enough && !hops.is_empty() && !cands.is_empty() {
                 let n = cands.len();
