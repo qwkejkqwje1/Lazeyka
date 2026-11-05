@@ -5,7 +5,7 @@ import { HomePage } from "home.slint";
 import { ServersPage } from "servers.slint";
 import { RoutesPage } from "routes.slint";
 import { SettingsPage } from "settings.slint";
-import { AddDialog, ServerDialog, AppsDialog, SourcesDialog, SubsDialog, LogDialog, AboutDialog, UninstallDialog, SortDialog, CountriesDialog, LocationDialog, TargetKindsDialog, TargetCountryDialog, TargetServerDialog, TargetChainDialog, ChainsDialog, ChainEditDialog, HopKindsDialog, HopCountryDialog, HopServerDialog, ListsDialog, ListEditDialog, ListNameDialog, ListDeleteDialog, RouteNameDialog, RouteDeleteDialog } from "dialogs.slint";
+import { AddDialog, ServerDialog, AppsDialog, SourcesDialog, SubsDialog, LogDialog, AboutDialog, UninstallDialog, SortDialog, CountriesDialog, LocationDialog, TargetKindsDialog, TargetCountryDialog, TargetServerDialog, TargetChainDialog, ChainsDialog, ChainEditDialog, HopKindsDialog, HopCountryDialog, HopServerDialog, ListsDialog, ListEditDialog, ListNameDialog, ListDeleteDialog, RouteNameDialog, RouteDeleteDialog, PresetsDialog } from "dialogs.slint";
 
 export { App, ServerItem, SourceItem, SubItem, CountryItem, RouteItem, TargetItem }
 
@@ -173,6 +173,7 @@ export component AppWindow inherits Window {
     if App.dialog == "list-edit": ListEditDialog { }
     if App.dialog == "list-name": ListNameDialog { }
     if App.dialog == "list-delete": ListDeleteDialog { }
+    if App.dialog == "presets": PresetsDialog { }
     if App.dialog == "route-name": RouteNameDialog { }
     if App.dialog == "route-delete": RouteDeleteDialog { }
 

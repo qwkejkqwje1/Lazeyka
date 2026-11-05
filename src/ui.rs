@@ -5,7 +5,7 @@
 use crate::sys;
 use lazeyka_core::engine::{ConnState, ServerView, StatusView};
 use lazeyka_core::model::{Origin, SVC_DISCORD, SVC_TELEGRAM, SVC_YOUTUBE};
-use lazeyka_core::{countries, ipc, util};
+use lazeyka_core::{countries, ipc, smart, util};
 use serde_json::{Value, json};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::cell::RefCell;
@@ -329,6 +329,7 @@ fn source_stat(v: &Value) -> String {
 struct Models {
     servers: Rc<VecModel<ServerItem>>,
     routes: Rc<VecModel<RouteItem>>,
+    presets: Rc<VecModel<PresetItem>>,
     target_countries: Rc<VecModel<TargetItem>>,
     target_servers: Rc<VecModel<TargetItem>>,
     target_chains: Rc<VecModel<TargetItem>>,
@@ -938,6 +939,8 @@ impl Ctl {
             .map(|c| c.name.clone())
             .unwrap_or_default();
         let has_chains = !chains.is_empty();
+        let issues: Vec<String> = v.get("issues").and_then(|x| serde_json::from_value(x.clone()).ok()).unwrap_or_default();
+        let issues_text = issues.iter().take(4).map(|t| format!("• {t}")).collect::<Vec<_>>().join("\n");
         let set_default = {
             let mut sh = self.sh.lock().unwrap();
             sh.routes = list.clone();
@@ -961,6 +964,7 @@ impl Ctl {
                 a.set_route_default(default);
             }
             a.set_has_chains(has_chains);
+            a.set_route_issues(ss(issues_text));
             a.set_default_chain_name(ss(default_chain));
             with_models(|m| sync(&m.routes, items));
         });
@@ -1205,7 +1209,17 @@ impl Ctl {
         let me = self.clone();
         self.ui(|w| w.global::<App>().set_dialog(ss("")));
         self.go(async move {
-            if let Some(list_id) = for_id.strip_prefix("@list:") {
+            if let Some(preset) = for_id.strip_prefix("@preset:") {
+                if let Some(v) = me.act(json!({ "cmd": "route_preset_add", "preset": preset, "target": code })).await {
+                    let id = v.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                    let name = v.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                    me.toast(format!("Добавлено: «{name}»"));
+                    me.load_routes().await;
+                    if !id.is_empty() {
+                        me.open_route(id);
+                    }
+                }
+            } else if let Some(list_id) = for_id.strip_prefix("@list:") {
                 // a list's own direction; an empty code clears it
                 me.act(json!({ "cmd": "list_update", "id": list_id, "target": code })).await;
                 me.load_routes().await;
@@ -1354,7 +1368,9 @@ impl Ctl {
     /// The direction picker's context for `target-for`: (code, kind, country).
     fn picker_of(&self, for_id: &str) -> (String, String, String) {
         let sh = self.sh.lock().unwrap();
-        let code = if let Some(id) = for_id.strip_prefix("@list:") {
+        let code = if let Some(id) = for_id.strip_prefix("@preset:") {
+            smart::preset(id).map(|p| p.hint.to_string()).unwrap_or_default()
+        } else if let Some(id) = for_id.strip_prefix("@list:") {
             sh.lists.iter().find(|l| l.id == id).map(|l| l.target.clone()).unwrap_or_default()
         } else if for_id == "@default" {
             sh.route_default_code.clone()
@@ -1833,6 +1849,11 @@ impl Ctl {
             return;
         }
         let me = self.clone();
+        // several entries, a URL list or a program among sites: the smart parser takes it
+        if value.contains(|c: char| c.is_whitespace() || c == ',' || c == ';') && !(kind == 1 && value.contains('\\')) {
+            self.bulk_add(id, value);
+            return;
+        }
         self.go(async move {
             if let Some(v) = me.act(json!({ "cmd": "route_entry_add", "id": id, "kind": kind_name(kind), "value": value })).await {
                 let name = v.get("value").and_then(Value::as_str).unwrap_or("").to_string();
@@ -1846,6 +1867,49 @@ impl Ctl {
                 me.poke.notify_one();
             }
         });
+    }
+
+    /// Pasted text of any shape: sites and programs are recognised automatically.
+    fn bulk_add(self: &Arc<Self>, id: String, text: String) {
+        let me = self.clone();
+        self.go(async move {
+            if let Some(v) = me.act(json!({ "cmd": "route_bulk", "id": id, "text": text })).await {
+                let added = v.get("added").and_then(Value::as_u64).unwrap_or(0);
+                let bad = v.get("rejected").and_then(Value::as_u64).unwrap_or(0);
+                let moved: Vec<String> = v.get("moved").and_then(|m| serde_json::from_value(m.clone()).ok()).unwrap_or_default();
+                let mut msg = format!("Добавлено: {added}");
+                if bad > 0 {
+                    msg.push_str(&format!(", не распознано: {bad}"));
+                }
+                if !moved.is_empty() {
+                    msg.push_str(&format!(". Часть перенесена из «{}»", moved.join("», «")));
+                }
+                me.toast(msg);
+                me.load_routes().await;
+                me.poke.notify_one();
+            }
+        });
+    }
+
+    async fn load_presets(self: &Arc<Self>) {
+        let Ok(v) = self.call(json!({ "cmd": "route_presets" })).await else { return };
+        let items: Vec<PresetItem> = v
+            .get("presets")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .map(|p| PresetItem {
+                        id: ss(p["id"].as_str().unwrap_or("")),
+                        name: ss(p["name"].as_str().unwrap_or("")),
+                        desc: ss(p["desc"].as_str().unwrap_or("")),
+                        hint: ss(p["hint_label"].as_str().unwrap_or("")),
+                        count: p["count"].as_i64().unwrap_or(0) as i32,
+                        added: p["added"].as_bool().unwrap_or(false),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.ui(move |_| with_models(|m| sync(&m.presets, items)));
     }
 
     fn route_import(self: &Arc<Self>, kind: i32) {
@@ -1931,6 +1995,7 @@ impl Ctl {
         self.go(async move {
             match name.as_str() {
                 "sources" | "subs" => me.load_sources().await,
+                "presets" => me.load_presets().await,
                 "log" => me.load_logs().await,
                 "target" => {
                     me.push_targets();
@@ -2303,6 +2368,7 @@ pub fn run(start_hidden: bool, replace: bool) -> anyhow::Result<()> {
     let models = Models {
         servers: Rc::new(VecModel::default()),
         routes: Rc::new(VecModel::default()),
+        presets: Rc::new(VecModel::default()),
         target_countries: Rc::new(VecModel::default()),
         target_servers: Rc::new(VecModel::default()),
         target_chains: Rc::new(VecModel::default()),
@@ -2321,6 +2387,7 @@ pub fn run(start_hidden: bool, replace: bool) -> anyhow::Result<()> {
         let a = w.global::<App>();
         a.set_servers(ModelRc::from(models.servers.clone()));
         a.set_routes(ModelRc::from(models.routes.clone()));
+        a.set_presets(ModelRc::from(models.presets.clone()));
         a.set_target_countries(ModelRc::from(models.target_countries.clone()));
         a.set_target_servers(ModelRc::from(models.target_servers.clone()));
         a.set_target_chains(ModelRc::from(models.target_chains.clone()));
@@ -2482,6 +2549,39 @@ fn wire(w: &AppWindow, ctl: &Arc<Ctl>) {
     });
     let c = ctl.clone();
     a.on_open_route(move |id| c.open_route(id.to_string()));
+    let c = ctl.clone();
+    a.on_preset_pick(move |id| {
+        let code = smart::preset(&id).map(|p| p.hint.to_string()).unwrap_or_default();
+        let (kind, cc) = if code.is_empty() { (String::new(), String::new()) } else { let (k, cc) = route_kind(&code); (k.to_string(), cc) };
+        let target_for = format!("@preset:{id}");
+        c.ui(move |w| {
+            let a = w.global::<App>();
+            a.set_target_for(ss(target_for));
+            a.set_target_step(0);
+            a.set_picker_target(ss(code));
+            a.set_picker_kind(ss(kind));
+            a.set_picker_cc(ss(cc));
+        });
+        c.open_dialog("target".into());
+    });
+    let c = ctl.clone();
+    a.on_explain_route(move |q| {
+        let q = q.to_string();
+        let c2 = c.clone();
+        c.go(async move {
+            let text = match c2.call(json!({ "cmd": "route_explain", "query": q })).await {
+                Ok(v) => v.get("text").and_then(Value::as_str).unwrap_or("").to_string(),
+                Err(e) => e,
+            };
+            c2.ui(move |w| w.global::<App>().set_explain_text(ss(text)));
+        });
+    });
+    let c = ctl.clone();
+    a.on_paste_bulk(move || match (sys::clipboard_get().filter(|t| !t.trim().is_empty()), c.route_id()) {
+        (Some(t), Some(id)) => c.bulk_add(id, t),
+        (None, _) => c.toast("Буфер обмена пуст"),
+        _ => {}
+    });
     let c = ctl.clone();
     a.on_new_route(move || {
         c.ui(|w| {

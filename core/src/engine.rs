@@ -217,6 +217,22 @@ pub enum Req {
         kind: Kind,
         text: String,
     },
+    /// Ready-made packs (AI services, Gemini, messengers …) with their state.
+    RoutePresets,
+    /// Creates a route from a pack (or refills the route of the same name).
+    RoutePresetAdd {
+        preset: String,
+        target: String,
+    },
+    /// Pasted text of any shape: sites and programs are recognised automatically.
+    RouteBulk {
+        id: String,
+        text: String,
+    },
+    /// Where does this site or program go, and which rule decides?
+    RouteExplain {
+        query: String,
+    },
     RouteExport {
         id: String,
         kind: Kind,
@@ -746,6 +762,10 @@ impl Engine {
             Req::RouteEntryRemove { id, kind, value } => self.route_entry_remove(&id, kind, &value).await,
             Req::RouteImport { id, kind, text } => self.route_import(&id, kind, &text).await,
             Req::RouteExport { id, kind } => self.route_export(&id, kind),
+            Req::RoutePresets => Ok(self.route_presets()),
+            Req::RoutePresetAdd { preset, target } => self.route_preset_add(&preset, &target).await,
+            Req::RouteBulk { id, text } => self.route_bulk(&id, &text).await,
+            Req::RouteExplain { query } => Ok(self.route_explain(&query)),
             Req::ListAdd { name } => self.list_add(&name).await,
             Req::ListUpdate { id, name, target } => self.list_update(&id, name, target).await,
             Req::ListRemove { id } => self.list_remove(&id).await,

@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::routes::{self, Chain, EntryList, Hop, Route, MAX_CHAINS, MAX_LISTS, MAX_ROUTES};
-use crate::{countries, split};
+use crate::{countries, smart, split};
 
 /// Servers of a country route (distinct hosts, best first).
 const COUNTRY_SERVERS: usize = 5;
@@ -392,6 +392,7 @@ impl Engine {
             "routes": list,
             "chains": chains,
             "lists": lists,
+            "issues": smart::lint(&st.settings.routes).into_iter().map(|i| i.text).collect::<Vec<_>>(),
             "countries": countries,
             "warp": warp,
         })
@@ -787,6 +788,119 @@ impl Engine {
         };
         self.routes_changed(&before).await?;
         Ok(json!({ "added": added, "rejected": bad }))
+    }
+
+    /// The pack catalog: what each pack holds and whether a route of that name exists.
+    pub(super) fn route_presets(&self) -> Value {
+        let st = self.st.lock().unwrap();
+        let list: Vec<Value> = smart::PRESETS
+            .iter()
+            .map(|p| {
+                let have = st.settings.routes.list.iter().find(|r| r.name == p.name);
+                json!({
+                    "id": p.id,
+                    "name": p.name,
+                    "desc": p.desc,
+                    "hint": p.hint,
+                    "hint_label": Target::parse(p.hint).map(|t| label(&st, &t)).unwrap_or_default(),
+                    "count": p.sites.len() + p.apps.len(),
+                    "added": have.is_some(),
+                })
+            })
+            .collect();
+        json!({ "presets": list })
+    }
+
+    /// A pack becomes a route (or tops up and redirects the route of the same name).
+    pub(super) async fn route_preset_add(self: &Arc<Self>, preset: &str, target: &str) -> Result<Value, String> {
+        let p = smart::preset(preset).ok_or("набор не найден")?;
+        let target = if target.is_empty() { p.hint } else { target };
+        let (sites, apps) = p.entries();
+        let existing = {
+            let st = self.st.lock().unwrap();
+            st.settings.routes.list.iter().find(|r| r.name == p.name).map(|r| r.id.clone())
+        };
+        match existing {
+            None => self.route_add(p.name, target, &sites, &apps).await,
+            Some(id) => {
+                let (before, moved) = {
+                    let mut st = self.st.lock().unwrap();
+                    let before = st.settings.routes.clone();
+                    let mut moved: Vec<String> = Vec::new();
+                    for (is_app, list) in [(false, &sites), (true, &apps)] {
+                        for v in list.iter() {
+                            for m in st.settings.routes.add_entry(&id, is_app, v).unwrap_or_default() {
+                                if !moved.contains(&m) {
+                                    moved.push(m);
+                                }
+                            }
+                        }
+                    }
+                    (before, moved)
+                };
+                self.routes_changed(&before).await?;
+                self.route_update(&id, None, Some(true), Some(target.to_string()), None).await?;
+                let connected = self.connected();
+                let st = self.st.lock().unwrap();
+                let r = st.settings.routes.get(&id).cloned().ok_or("маршрут не найден")?;
+                let mut v = Self::route_json(&st, &r, connected);
+                v["moved"] = json!(moved);
+                Ok(v)
+            }
+        }
+    }
+
+    /// Adds pasted text of any shape to a route.
+    pub(super) async fn route_bulk(self: &Arc<Self>, id: &str, text: &str) -> Result<Value, String> {
+        let b = smart::parse_bulk(text);
+        let (before, added, moved) = {
+            let mut st = self.st.lock().unwrap();
+            if st.settings.routes.get(id).is_none() {
+                return Err("маршрут не найден".into());
+            }
+            let before = st.settings.routes.clone();
+            let mut added = 0usize;
+            let mut moved: Vec<String> = Vec::new();
+            for (is_app, list) in [(false, &b.sites), (true, &b.apps)] {
+                for v in list {
+                    let had = st.settings.routes.get(id).is_some_and(|r| r.list(is_app).contains(v));
+                    for m in st.settings.routes.add_entry(id, is_app, v).unwrap_or_default() {
+                        if !moved.contains(&m) {
+                            moved.push(m);
+                        }
+                    }
+                    if !had {
+                        added += 1;
+                    }
+                }
+            }
+            (before, added, moved)
+        };
+        self.routes_changed(&before).await?;
+        Ok(json!({ "added": added, "found": b.sites.len() + b.apps.len(), "rejected": b.rejected.len(), "rejected_sample": b.rejected.iter().take(3).collect::<Vec<_>>(), "moved": moved }))
+    }
+
+    /// "Where will this go?" in plain words.
+    pub(super) fn route_explain(&self, query: &str) -> Value {
+        let st = self.st.lock().unwrap();
+        let ex = smart::explain(&st.settings.routes, query);
+        let what = match &ex.subject {
+            smart::Subject::Site(s) => s.clone(),
+            smart::Subject::App(a) => a.clone(),
+            smart::Subject::Invalid => return json!({ "ok": false, "text": "Не похоже на адрес сайта или имя программы" }),
+        };
+        let mut lines: Vec<String> = Vec::new();
+        match ex.winner() {
+            Some(h) => {
+                let why = if h.entry == what { format!("«{}»", h.name) } else { format!("«{}» (правило {})", h.name, h.entry) };
+                lines.push(format!("{what} → {}. Решает маршрут {why}.", label(&st, &h.target)));
+                for o in ex.hits.iter().skip(1) {
+                    lines.push(format!("Также подходит «{}» ({}), но он ниже по списку — не сработает.", o.name, label(&st, &o.target)));
+                }
+            }
+            None => lines.push(format!("{what} → {}. Ни один маршрут не подошёл — действует «Остальной трафик».", label(&st, &ex.default))),
+        }
+        json!({ "ok": true, "text": lines.join("\n"), "target": ex.target().code() })
     }
 
     pub(super) fn route_export(&self, id: &str, kind: Kind) -> Result<Value, String> {

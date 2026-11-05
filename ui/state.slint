@@ -56,6 +56,17 @@ export struct RouteItem {
     last: bool,
 }
 
+// A ready-made pack in the catalog.
+export struct PresetItem {
+    id: string,
+    name: string,
+    desc: string,
+    // suggested direction, "Через страну: США"
+    hint: string,
+    count: int,
+    added: bool,
+}
+
 // A choice in the direction picker (a country or a server).
 export struct TargetItem {
     code: string,
@@ -146,6 +157,11 @@ export global App {
     // routes: 0 — traffic without a route goes through the VPN, 1 — directly
     in-out property <int> route-default;
     in property <[RouteItem]> routes;
+    in property <[PresetItem]> presets;
+    // problems found in the routes, one per line ("" = none)
+    in property <string> route-issues;
+    // answer to "where will this go?"
+    in property <string> explain-text;
     in property <int> routes-on;
     in property <int> routes-spare;
     // route editor (shown instead of the list while route-open)
@@ -217,6 +233,9 @@ export global App {
     callback set-route-default(int);
     callback open-route(string);
     callback new-route();
+    callback preset-pick(string);
+    callback explain-route(string);
+    callback paste-bulk();
     callback pick-target(string);
     // chains
     callback edit-chains();

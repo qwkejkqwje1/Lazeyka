@@ -13,6 +13,7 @@ pub mod netif;
 pub mod probe;
 pub mod routes;
 pub mod scan;
+pub mod smart;
 pub mod sources;
 pub mod store;
 pub mod split;

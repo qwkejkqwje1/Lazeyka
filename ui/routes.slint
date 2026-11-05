@@ -1,6 +1,6 @@
 import { Theme } from "theme.slint";
 import { Icon } from "icons.slint";
-import { App, RouteItem } from "state.slint";
+import { App, RouteItem, PresetItem } from "state.slint";
 import { Clickable, Btn, IconButton, Segmented, Field, Toggle, SectionTitle, OptionRow } from "widgets.slint";
 import { ListView } from "std-widgets.slint";
 
@@ -159,6 +159,51 @@ component RouteList inherits VerticalLayout {
             }
         }
     }
+    Rectangle {
+        background: Theme.card;
+        border-radius: Theme.radius;
+        height: ex.preferred-height;
+        ex := VerticalLayout {
+            padding: 12px;
+            spacing: 8px;
+            Text {
+                text: "Куда пойдёт сайт или программа?";
+                color: Theme.text;
+                font-size: 13.5px;
+                font-weight: 600;
+            }
+            Field {
+                placeholder: "gemini.google.com или chrome.exe";
+                icon: "radar";
+                accepted(t) => { App.explain-route(t); }
+            }
+            if App.explain-text != "": Text {
+                text: App.explain-text;
+                color: Theme.dim;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+        }
+    }
+    if App.route-issues != "": Rectangle {
+        background: Theme.warn.with-alpha(0.10);
+        border-radius: Theme.radius;
+        border-width: 1px;
+        border-color: Theme.warn.with-alpha(0.35);
+        height: iss.preferred-height;
+        iss := HorizontalLayout {
+            padding: 10px;
+            spacing: 8px;
+            Icon { y: 2px; name: "alert"; size: 16px; color: Theme.warn; }
+            Text {
+                text: App.route-issues;
+                color: Theme.warn;
+                font-size: 11.5px;
+                wrap: word-wrap;
+                horizontal-stretch: 1;
+            }
+        }
+    }
     if App.routes.length > 0: SectionTitle {
         text: "ВЕРХНИЕ МАРШРУТЫ ВАЖНЕЕ НИЖНИХ";
         x: 4px;
@@ -199,11 +244,22 @@ component RouteList inherits VerticalLayout {
             wrap: word-wrap;
         }
     }
-    Btn {
-        text: "Новый маршрут";
-        icon: "plus";
-        kind: App.routes.length == 0 ? 0 : 1;
-        clicked => { App.new-route(); }
+    HorizontalLayout {
+        spacing: 8px;
+        Btn {
+            text: "Каталог наборов";
+            icon: "list";
+            kind: 0;
+            horizontal-stretch: 1;
+            clicked => { App.open-dialog("presets"); }
+        }
+        Btn {
+            text: "Новый маршрут";
+            icon: "plus";
+            kind: 1;
+            horizontal-stretch: 1;
+            clicked => { App.new-route(); }
+        }
     }
 }
 
@@ -354,7 +410,7 @@ component RouteEditor inherits VerticalLayout {
     HorizontalLayout {
         spacing: 8px;
         input := Field {
-            placeholder: App.list-tab == 0 ? "example.com или 10.0.0.0/8" : "program.exe";
+            placeholder: App.list-tab == 0 ? "example.com, 10.0.0.0/8 — или вставьте целый список" : "program.exe — или вставьте целый список";
             icon: App.list-tab == 0 ? "globe" : "app";
             accepted(t) => {
                 if (t != "") {
@@ -444,6 +500,13 @@ component RouteEditor inherits VerticalLayout {
     HorizontalLayout {
         spacing: 8px;
         alignment: end;
+        Btn {
+            text: "Вставить из буфера";
+            icon: "clipboard";
+            kind: 1;
+            min-height: 32px;
+            clicked => { App.paste-bulk(); }
+        }
         Btn {
             text: "Импорт";
             icon: "download";
