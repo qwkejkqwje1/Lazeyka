@@ -1,6 +1,6 @@
 //! Persistent state: settings, known servers, WARP account, source statistics.
 
-use crate::model::Server;
+use crate::model::{Origin, Server};
 use crate::scan::SourceStat;
 use crate::sources::SourceDef;
 use crate::routes::Routes;
@@ -26,6 +26,9 @@ impl Paths {
     }
     pub fn warp(&self) -> PathBuf {
         self.data.join("warp.json")
+    }
+    pub fn grave(&self) -> PathBuf {
+        self.data.join("graveyard.json")
     }
     pub fn stats(&self) -> PathBuf {
         self.data.join("sources.json")
@@ -120,6 +123,17 @@ pub struct Settings {
     /// checks servers there first. Empty = any country.
     #[serde(default)]
     pub countries: Vec<String>,
+    /// Traffic through the VPN over all sessions, bytes (counted from mihomo's own counters).
+    #[serde(default)]
+    pub traffic_up: u64,
+    #[serde(default)]
+    pub traffic_down: u64,
+    /// Test servers that do not answer directly through a working entry hop.
+    #[serde(default = "t")]
+    pub relay_scan: bool,
+    /// Check for new versions of the program and mihomo; mihomo is installed by itself.
+    #[serde(default = "t")]
+    pub auto_update: bool,
     /// Server list order in the UI: "best", "ping", "speed", "stable".
     #[serde(default = "best")]
     pub sort: String,
@@ -182,24 +196,120 @@ pub fn save<T: Serialize>(p: &Path, v: &T) -> std::io::Result<()> {
 
 pub type Stats = HashMap<String, SourceStat>;
 
-/// Drops free servers that are stale (not seen working for 3 days and not recently checked).
-/// Favourites are kept.
-pub fn prune(servers: &mut Vec<Server>, now: u64) {
+/// Ids of removed dead servers → when they were buried. Sources keep listing the same
+/// corpses; the graveyard stops them from coming back (and being re-tested) for a while.
+pub type Grave = HashMap<String, u64>;
+
+/// A server that has not worked for this long (and keeps failing) is removed.
+pub const DEAD_AFTER: u64 = 14 * 86400;
+/// Never-working servers get a shorter leash.
+pub const NEVER_AFTER: u64 = 7 * 86400;
+/// How long a buried server is refused when a source lists it again.
+pub const GRAVE_TTL: u64 = 21 * 86400;
+const GRAVE_MAX: usize = 40_000;
+
+/// Dead for weeks: it failed at least three checks in a row and has not worked within
+/// the period (or never worked since it was added a week ago). Untested ones are only
+/// judged by age. Favourites, own servers and WARP are never dead.
+pub fn is_dead(s: &Server, now: u64) -> bool {
+    if s.origin != Origin::Free || s.fav {
+        return false;
+    }
+    if s.probe.is_none() {
+        return now.saturating_sub(s.added) > DEAD_AFTER;
+    }
+    if s.fails < 3 || s.good() {
+        return false;
+    }
+    if s.last_ok > 0 {
+        now.saturating_sub(s.last_ok) > DEAD_AFTER
+    } else {
+        now.saturating_sub(s.added) > NEVER_AFTER
+    }
+}
+
+/// Drops free servers that are dead for weeks or stale (not seen working for a week and
+/// not checked for three days). Favourites are kept. Returns the removed ids.
+pub fn prune(servers: &mut Vec<Server>, now: u64) -> Vec<String> {
+    let mut gone = Vec::new();
     servers.retain(|s| {
-        if s.origin != crate::model::Origin::Free || s.fav {
+        if s.origin != Origin::Free || s.fav {
             return true;
         }
         let checked = s.probe.as_ref().map(|p| p.at).unwrap_or(s.added);
         let fresh = now.saturating_sub(checked) < 3 * 86400;
         let worked = now.saturating_sub(s.last_ok) < 7 * 86400;
-        fresh || worked
+        let keep = (fresh || worked) && !is_dead(s, now);
+        if !keep {
+            gone.push(s.id.clone());
+        }
+        keep
     });
+    gone
+}
+
+/// Records buried ids and forgets old graves (and the oldest ones beyond the cap).
+pub fn bury(grave: &mut Grave, ids: &[String], now: u64) {
+    for id in ids {
+        grave.insert(id.clone(), now);
+    }
+    grave.retain(|_, t| now.saturating_sub(*t) < GRAVE_TTL);
+    if grave.len() > GRAVE_MAX {
+        let mut v: Vec<(String, u64)> = grave.drain().collect();
+        v.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
+        v.truncate(GRAVE_MAX);
+        grave.extend(v);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::routes::Target;
+
+    fn free(fails: u32, last_ok: u64, added: u64, checked: Option<u64>) -> Server {
+        let p: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"type":"trojan","server":"1.2.3.4","port":443,"password":"x"}"#).unwrap();
+        let mut s = Server::new("t", p, Origin::Free, "t").unwrap();
+        s.added = added;
+        s.fails = fails;
+        s.last_ok = last_ok;
+        s.probe = checked.map(|at| crate::model::Probe { at, ok: false, ..Default::default() });
+        s
+    }
+
+    #[test]
+    fn dead_servers_are_pruned_and_buried() {
+        let day = 86400;
+        let now = 100 * day;
+        // keeps failing for weeks although it is "checked" every day
+        let corpse = free(9, now - 30 * day, now - 60 * day, Some(now - 1000));
+        // worked 3 days ago: only flapping
+        let flaky = free(5, now - 3 * day, now - 60 * day, Some(now - 1000));
+        // never worked, added 10 days ago
+        let never = free(6, 0, now - 10 * day, Some(now - 1000));
+        // never worked but added yesterday
+        let newcomer = free(2, 0, now - day, Some(now - 1000));
+        // untested for a month
+        let forgotten = free(0, 0, now - 30 * day, None);
+        let mut fav = free(9, 0, now - 90 * day, Some(now - 1000));
+        fav.fav = true;
+        assert!(is_dead(&corpse, now) && is_dead(&never, now) && is_dead(&forgotten, now));
+        assert!(!is_dead(&flaky, now) && !is_dead(&newcomer, now) && !is_dead(&fav, now));
+        let mut all = vec![corpse, flaky, never, newcomer, forgotten, fav];
+        for (i, x) in all.iter_mut().enumerate() {
+            x.id = format!("s{i}");
+        }
+        let gone = prune(&mut all, now);
+        assert_eq!(gone, ["s0", "s2", "s4"]);
+        assert_eq!(all.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), ["s1", "s3", "s5"]);
+        let mut g = Grave::new();
+        bury(&mut g, &gone, now);
+        assert_eq!(g.len(), 3);
+        // old graves expire
+        bury(&mut g, &[], now + GRAVE_TTL + 1);
+        assert!(g.is_empty());
+    }
 
     #[test]
     fn split_settings_become_routes() {

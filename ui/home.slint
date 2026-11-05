@@ -166,6 +166,12 @@ export component HomePage inherits Rectangle {
                 }
             }
         }
+        if App.totals-all != "": Text {
+            text: App.totals-all;
+            color: Theme.faint;
+            font-size: 11.5px;
+            horizontal-alignment: center;
+        }
         // current server
         Clickable {
             height: 66px;

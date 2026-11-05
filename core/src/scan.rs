@@ -148,6 +148,10 @@ pub fn score(s: &Server) -> i64 {
         sc -= (sp as i64 / 50).min(400);
     }
     sc += proto_rank(s) as i64 * 40;
+    // two hops: slower and one more thing that can break
+    if s.relay.is_some() {
+        sc += 150;
+    }
     sc -= (s.oks.min(20) as i64) * 5;
     // flaky servers sink: 75% of checks passed → +100
     if s.hist_n >= 4 {
@@ -279,6 +283,154 @@ pub fn reasons(list: &[Server]) -> String {
     v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let rest: Vec<String> = v.iter().take(6).map(|(k, n)| format!("{k} ×{n}")).collect();
     format!("рабочих {ok}; отказы: {}", if rest.is_empty() { "нет".to_string() } else { rest.join(", ") })
+}
+
+/// Working servers that can carry another server's connection: the best few of different
+/// hosts, no relay servers themselves, no WARP (its single key must not be shared).
+pub fn relay_hops(all: &[Server], n: usize) -> Vec<Server> {
+    let mut v: Vec<&Server> = all.iter().filter(|s| s.good() && s.relay.is_none() && s.origin != Origin::Warp && !insecure(s)).collect();
+    v.sort_by_key(|s| (score(s), s.id.clone()));
+    let mut hosts = HashSet::new();
+    v.into_iter().filter(|s| hosts.insert(s.host.clone())).take(n).cloned().collect()
+}
+
+/// Servers worth a second look through a hop: TCP-based, failed from here because the
+/// way to them is closed (port closed / no answer), not tried through a hop lately.
+pub fn relay_candidates(all: &[Server], now: u64, limit: usize, retry_after: u64) -> Vec<Server> {
+    let unreachable = |e: &str| e.starts_with("порт закрыт") || e.starts_with("не отвечает");
+    let mut v: Vec<&Server> = all
+        .iter()
+        .filter(|s| s.origin != Origin::Warp && s.relay.is_none() && !insecure(s) && !is_udp_proto(s))
+        .filter(|s| now.saturating_sub(s.relay_at) >= retry_after)
+        .filter(|s| s.probe.as_ref().is_some_and(|p| !p.ok && p.error.as_deref().is_some_and(unreachable)))
+        .collect();
+    v.sort_by_key(|s| {
+        let fresh = now.saturating_sub(s.added) < 24 * 3600;
+        (if s.origin == Origin::Mine || s.fav { 0 } else { 1 }, if s.oks > 0 { 0 } else { 1 }, if fresh { 0 } else { 1 }, proto_rank(s), s.id.clone())
+    });
+    v.into_iter().take(limit).cloned().collect()
+}
+
+/// Tests servers through working entry hops. In one lab: the hops themselves and, for
+/// every candidate, a copy that dials through its hop (the one in `relay` when it is
+/// among `hops`, else round-robin). Successes come back with `relay` set and a fresh
+/// probe; failures only get `relay_at` (their direct failure was already counted).
+pub async fn check_relay(env: &Env, list: Vec<Server>, hops: Vec<Server>, o: &Opts, net: &mut NetInfo, mut on_batch: impl FnMut(&[Server])) -> Vec<Server> {
+    let mut done: Vec<Server> = Vec::new();
+    if hops.is_empty() || list.is_empty() {
+        return done;
+    }
+    env.progress.lock().unwrap().total += list.len();
+    let nh = hops.len();
+    let mut queue: std::collections::VecDeque<Server> = list.into_iter().collect();
+    while !queue.is_empty() && !env.cancelled() {
+        env.stage("Проверка через входное звено");
+        let n = o.batch.min(queue.len());
+        let mut batch: Vec<Server> = queue.drain(..n).collect();
+        let mut lab = None;
+        let mut variants: Vec<Server> = Vec::new();
+        let mut hop_ids: Vec<String> = Vec::new();
+        for _ in 0..6 {
+            variants.clear();
+            hop_ids.clear();
+            for (i, s) in batch.iter().enumerate() {
+                let hop = s.relay.as_ref().and_then(|r| hops.iter().find(|h| &h.id == r)).unwrap_or(&hops[i % nh]);
+                let mut v = s.clone();
+                v.id = format!("{}~r", s.id);
+                v.relay = None;
+                v.proxy.insert("dialer-proxy".into(), serde_json::Value::String(hop.id.clone()));
+                variants.push(v);
+                hop_ids.push(hop.id.clone());
+            }
+            let mut refs: Vec<&Server> = hops.iter().collect();
+            refs.extend(variants.iter());
+            match start_lab(env, &refs).await {
+                Ok(l) => {
+                    lab = Some(l);
+                    break;
+                }
+                Err(e) => {
+                    if let Some(i) = bad_proxy_index(&e).filter(|i| *i >= nh && *i - nh < batch.len()) {
+                        let mut bad = batch.remove(i - nh);
+                        bad.relay_at = util::now();
+                        done.push(bad);
+                        env.progress.lock().unwrap().done += 1;
+                        continue;
+                    }
+                    env.progress.lock().unwrap().error = Some(e);
+                    break;
+                }
+            }
+        }
+        let Some(mut lab) = lab else { break };
+        let alive = lab.proc.api.group_delay("ALL", mihomo::TEST_URL, o.delay_timeout_ms * 2).await;
+        let sem = Arc::new(tokio::sync::Semaphore::new(o.parallel.max(1)));
+        let mut js = tokio::task::JoinSet::new();
+        let mut results: Vec<Option<(Probe, Option<probe::Trace>)>> = vec![None; batch.len()];
+        let mut skipped = 0usize;
+        for (i, v) in variants.iter().enumerate() {
+            if !alive.contains_key(&v.id) {
+                skipped += 1;
+                continue;
+            }
+            let l = &lab.nodes[nh + i];
+            let nc = probe::NodeCheck { port: l.port, user: l.user.clone(), pass: l.pass.clone(), udp: false, services: o.services };
+            let sem = sem.clone();
+            js.spawn(async move {
+                let _permit = sem.acquire_owned().await;
+                (i, probe::check_node(&nc).await)
+            });
+        }
+        env.progress.lock().unwrap().done += skipped;
+        while let Some(r) = js.join_next().await {
+            if env.cancelled() {
+                js.abort_all();
+                break;
+            }
+            if let Ok((i, res)) = r {
+                results[i] = Some(res);
+                env.progress.lock().unwrap().done += 1;
+            }
+        }
+        lab.proc.stop().await;
+        let now = util::now();
+        let mut finished = Vec::new();
+        let mut good = 0usize;
+        for ((mut s, r), hop) in batch.into_iter().zip(results).zip(hop_ids) {
+            let was_relay = s.relay.is_some();
+            s.relay_at = now;
+            if let Some((p, t)) = r.clone().filter(|(p, _)| p.ok) {
+                let mut checked = s.clone();
+                finalize(&mut checked, p, t, net, env.geo.as_deref());
+                if checked.good() {
+                    checked.relay = Some(hop);
+                    checked.relay_at = now;
+                    good += 1;
+                    finished.push(checked);
+                    continue;
+                }
+            }
+            if was_relay {
+                // a recheck of a relay server: the failure counts; after three it is
+                // tried directly again like everyone else
+                let (p, t) = r.unwrap_or_else(|| (Probe { at: now, error: Some("не отвечает (через звено)".into()), ..Default::default() }, None));
+                finalize(&mut s, p, t, net, env.geo.as_deref());
+                if s.fails >= 3 {
+                    s.relay = None;
+                }
+            }
+            finished.push(s);
+        }
+        env.progress.lock().unwrap().good += good;
+        on_batch(&finished);
+        done.extend(finished);
+    }
+    done
+}
+
+/// A relay server is only usable while the hop it dials through works.
+pub fn relay_ok(all: &[Server], s: &Server) -> bool {
+    s.relay.as_ref().is_none_or(|r| all.iter().any(|h| &h.id == r && h.good() && h.relay.is_none()))
 }
 
 /// Server exits in one of `cc` (an empty set matches everything).
@@ -787,6 +939,36 @@ mod tests {
         assert!(!countries_usable(&all, &jp));
         let p = pool(&all, &PoolOpts { size: 1, countries: &jp, warp: true, selected: None });
         assert_eq!(ids(p), ["fav", "mine-ok", "fast", "mine-new", "mine-dead"]);
+    }
+
+    #[test]
+    fn relay_selection() {
+        let mut dead = srv("9.9.9.9", Origin::Free, Some((0, "NL")));
+        dead.probe.as_mut().unwrap().error = Some("порт закрыт (TCP)".into());
+        let mut weird = srv("8.8.8.8", Origin::Free, Some((0, "NL")));
+        weird.probe.as_mut().unwrap().error = Some("подмена содержимого".into());
+        let mut tried = dead.clone();
+        tried.host = "7.7.7.7".into();
+        tried.id = "tried".into();
+        tried.relay_at = 1000;
+        let good_a = srv("1.1.1.1", Origin::Free, Some((50, "DE")));
+        let good_b = srv("1.1.1.1", Origin::Free, Some((60, "DE")));
+        let all = vec![dead.clone(), weird, tried, good_a.clone(), good_b];
+        let c = relay_candidates(&all, 1100, 10, 600);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].host, "9.9.9.9");
+        // the "tried" one comes back after the pause
+        assert_eq!(relay_candidates(&all, 1700, 10, 600).len(), 2);
+        // hops: good servers, one per host
+        let h = relay_hops(&all, 3);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].host, "1.1.1.1");
+        // relay servers rank below the same server reached directly
+        let mut r = good_a.clone();
+        let direct = score(&r);
+        r.relay = Some("x".into());
+        assert!(score(&r) > direct);
+        assert_eq!(r.mihomo_proxy()["dialer-proxy"], "hop:x");
     }
 
     #[test]

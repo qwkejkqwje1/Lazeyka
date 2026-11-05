@@ -54,6 +54,8 @@ export struct RouteItem {
     warn: string,
     // when the chosen country has no working server: "fastest", "warp", "direct", "block"
     fallback: string,
+    // how a country route picks its server: "failover", "fastest", "balance"
+    strategy: string,
     first: bool,
     last: bool,
 }
@@ -131,6 +133,18 @@ export global App {
     in property <string> down;
     in property <string> up;
     in property <string> totals;
+    // traffic through the VPN over all sessions ("" = nothing yet)
+    in property <string> totals-all;
+    // updates: newer versions found ("" = none), a download in progress, settings
+    in property <string> upd-program;
+    in property <string> upd-mihomo;
+    in property <string> upd-text;
+    in property <bool> upd-busy;
+    in property <bool> auto-update: true;
+    in property <bool> relay-scan: true;
+    callback check-updates();
+    callback install-program-update();
+    callback install-mihomo-update();
     // search
     in property <bool> scanning;
     in property <float> scan-progress;
@@ -266,6 +280,7 @@ export global App {
     callback route-toggle(string, bool);
     callback route-move(string, int);
     callback route-fallback(string, string);
+    callback route-strategy(string, string);
     callback route-sort();
     callback route-rename(string, string);
     callback route-delete(string);

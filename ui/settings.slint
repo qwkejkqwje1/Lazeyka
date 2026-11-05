@@ -49,6 +49,13 @@ export component SettingsPage inherits Rectangle {
                             toggled(v) => { App.set-flag("warp", v); }
                         }
                         Divider { }
+                        SettingRow {
+                            title: "Поиск через входное звено";
+                            subtitle: "Серверы, закрытые напрямую, проверять через рабочий сервер";
+                            checked: App.relay-scan;
+                            toggled(v) => { App.set-flag("relay_scan", v); }
+                        }
+                        Divider { }
                         LinkRow {
                             title: "Источники серверов";
                             subtitle: "Откуда брать бесплатные серверы";
@@ -96,6 +103,33 @@ export component SettingsPage inherits Rectangle {
                                 font-size: 11.5px;
                                 wrap: word-wrap;
                             }
+                        }
+                    }
+                }
+                SectionTitle { text: "ОБНОВЛЕНИЯ"; x: 4px; }
+                Card {
+                    VerticalLayout {
+                        SettingRow {
+                            title: "Проверять обновления";
+                            subtitle: "Раз в 12 часов; mihomo обновляется сам";
+                            checked: App.auto-update;
+                            toggled(v) => { App.set-flag("auto_update", v); }
+                        }
+                        Divider { }
+                        LinkRow {
+                            title: App.upd-program != "" ? "Доступна Лазейка " + App.upd-program : "Лазейка " + App.version;
+                            subtitle: App.upd-busy ? "Загрузка…" : App.upd-program != "" ? "Нажмите, чтобы скачать и установить" : (App.upd-text != "" ? App.upd-text : "Нажмите, чтобы проверить обновления");
+                            icon: "refresh";
+                            clicked => {
+                                if (App.upd-program != "") { App.install-program-update(); } else { App.check-updates(); }
+                            }
+                        }
+                        if App.upd-mihomo != "": Divider { }
+                        if App.upd-mihomo != "": LinkRow {
+                            title: "Доступен mihomo " + App.upd-mihomo;
+                            subtitle: "Нажмите, чтобы установить (применится при подключении)";
+                            icon: "refresh";
+                            clicked => { App.install-mihomo-update(); }
                         }
                     }
                 }

@@ -17,6 +17,7 @@ pub mod smart;
 pub mod sources;
 pub mod store;
 pub mod split;
+pub mod update;
 pub mod util;
 pub mod warp;
 

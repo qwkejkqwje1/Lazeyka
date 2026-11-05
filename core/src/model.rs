@@ -158,6 +158,18 @@ pub struct Server {
     /// Number of valid bits in `hist` (≤ 32).
     #[serde(default, skip_serializing_if = "is_zero8")]
     pub hist_n: u8,
+    /// The server answers only through this working server (its id): the direct path from
+    /// here is blocked, the entry hop gets the connection out. TCP-based protocols only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
+    /// Last attempt to test the server through an entry hop (unix seconds).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub relay_at: u64,
+}
+
+/// Name of the config-level copy of a working server that relay servers dial through.
+pub fn hop_name(id: &str) -> String {
+    format!("hop:{id}")
 }
 
 fn is_zero(v: &u64) -> bool {
@@ -203,6 +215,8 @@ impl Server {
             fav: false,
             hist: 0,
             hist_n: 0,
+            relay: None,
+            relay_at: 0,
         })
     }
 
@@ -210,6 +224,9 @@ impl Server {
     pub fn mihomo_proxy(&self) -> Value {
         let mut m = self.proxy.clone();
         m.insert("name".into(), Value::String(self.id.clone()));
+        if let Some(h) = &self.relay {
+            m.insert("dialer-proxy".into(), Value::String(hop_name(h)));
+        }
         Value::Object(m)
     }
 

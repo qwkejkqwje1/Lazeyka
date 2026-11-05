@@ -346,6 +346,17 @@ component RouteEditor inherits VerticalLayout {
             current: App.route.fallback == "warp" ? 1 : App.route.fallback == "direct" ? 2 : App.route.fallback == "block" ? 3 : 0;
             changed(i) => { App.route-fallback(App.route.id, i == 1 ? "warp" : i == 2 ? "direct" : i == 3 ? "block" : "fastest"); }
         }
+        Text {
+            text: "Если серверов несколько:";
+            color: Theme.dim;
+            font-size: 11.5px;
+            x: 4px;
+        }
+        Segmented {
+            items: ["По порядку", "Быстрейший", "Баланс"];
+            current: App.route.strategy == "fastest" ? 1 : App.route.strategy == "balance" ? 2 : 0;
+            changed(i) => { App.route-strategy(App.route.id, i == 1 ? "fastest" : i == 2 ? "balance" : "failover"); }
+        }
     }
     if App.route.warn != "" && App.route.enabled: HorizontalLayout {
         spacing: 8px;

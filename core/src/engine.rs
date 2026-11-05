@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod route_ops;
+mod update_ops;
 
 pub const TUN: &str = "Lazeyka";
 
@@ -49,12 +50,16 @@ struct Traffic {
     down: u64,
     up_total: u64,
     down_total: u64,
+    /// Last time the lifetime totals were written to disk.
+    saved: Option<Instant>,
 }
 
 struct State {
     settings: Settings,
     servers: Vec<Server>,
     stats: store::Stats,
+    /// Buried dead servers (see `store::bury`).
+    grave: store::Grave,
     warp: Option<warp::Account>,
     net: NetInfo,
     conn: Conn,
@@ -68,6 +73,7 @@ struct State {
     /// Routes whose own servers do not answer: their traffic uses the VPN for now.
     route_spare: HashSet<String>,
     last_route_check: u64,
+    update: update_ops::UpdateState,
 }
 
 /// What the running mihomo was given (to rebuild the configuration in place).
@@ -164,6 +170,12 @@ pub enum Req {
     },
     RefreshSubscriptions,
     Settings,
+    /// Looks for new versions of the program and mihomo.
+    UpdateCheck,
+    /// Installs the newer mihomo found by the check.
+    UpdateMihomo,
+    /// Downloads the newer program package; the UI starts its installer.
+    UpdateProgram,
     SetSettings {
         patch: Value,
     },
@@ -196,6 +208,9 @@ pub enum Req {
         /// "fastest", "warp", "direct" or "block": what to do without own servers.
         #[serde(default)]
         fallback: Option<String>,
+        /// "failover", "fastest" or "balance": how a country route picks its server.
+        #[serde(default)]
+        strategy: Option<String>,
     },
     RouteRemove {
         id: String,
@@ -390,6 +405,9 @@ pub struct StatusView {
     pub down: u64,
     pub up_total: u64,
     pub down_total: u64,
+    /// Over all sessions.
+    pub up_all: u64,
+    pub down_all: u64,
     pub user_cc: Option<String>,
     /// "vpn" or "direct": where traffic without a route goes.
     pub routes_default: String,
@@ -406,6 +424,10 @@ pub struct StatusView {
     pub countries_ok: bool,
     pub notice_id: u64,
     pub notice: String,
+    /// Newer program version found by the last check ("" = none).
+    pub update_program: String,
+    /// Newer mihomo version found by the last check ("" = none).
+    pub update_mihomo: String,
 }
 
 fn is_wg(s: &Server) -> bool {
@@ -421,6 +443,7 @@ impl Engine {
         }
         let servers: Vec<Server> = store::load(&paths.servers());
         let stats: store::Stats = store::load(&paths.stats());
+        let grave: store::Grave = store::load(&paths.grave());
         let warp: Option<warp::Account> = store::load(&paths.warp());
         let e = Arc::new(Engine {
             paths,
@@ -429,6 +452,7 @@ impl Engine {
                 settings,
                 servers,
                 stats,
+                grave,
                 warp,
                 net: NetInfo::default(),
                 conn: Conn::default(),
@@ -440,6 +464,7 @@ impl Engine {
                 notice: (0, String::new()),
                 route_spare: HashSet::new(),
                 last_route_check: 0,
+                update: update_ops::UpdateState::default(),
             }),
             op: tokio::sync::Mutex::new(()),
             main: tokio::sync::Mutex::new(None),
@@ -461,6 +486,8 @@ impl Engine {
     pub fn start(self: &Arc<Self>) {
         let me = self.clone();
         tokio::spawn(async move { me.maintenance().await });
+        let me = self.clone();
+        tokio::spawn(async move { me.update_loop().await });
         let restore = {
             let st = self.st.lock().unwrap();
             st.settings.connect_on_start || st.settings.was_connected
@@ -499,11 +526,19 @@ impl Engine {
     }
 
     fn save_servers(&self) {
-        let (servers, stats) = {
+        let (servers, stats, grave, gone) = {
             let mut st = self.st.lock().unwrap();
-            store::prune(&mut st.servers, util::now());
-            (st.servers.clone(), st.stats.clone())
+            let now = util::now();
+            let gone = store::prune(&mut st.servers, now);
+            if !gone.is_empty() {
+                store::bury(&mut st.grave, &gone, now);
+            }
+            (st.servers.clone(), st.stats.clone(), st.grave.clone(), gone.len())
         };
+        if gone > 0 {
+            self.log(&format!("убрано мёртвых серверов: {gone}; в базе {}", servers.len()));
+            let _ = store::save(&self.paths.grave(), &grave);
+        }
         let _ = store::save(&self.paths.servers(), &servers);
         let _ = store::save(&self.paths.stats(), &stats);
     }
@@ -545,6 +580,8 @@ impl Engine {
                     e.last_ok = s.last_ok;
                     e.hist = s.hist;
                     e.hist_n = s.hist_n;
+                    e.relay = s.relay.clone();
+                    e.relay_at = s.relay_at;
                 }
                 None => st.servers.push(s.clone()),
             }
@@ -562,14 +599,53 @@ impl Engine {
     fn add_new(&self, list: Vec<Server>) -> usize {
         let mut st = self.st.lock().unwrap();
         let known: HashSet<String> = st.servers.iter().map(|s| s.id.clone()).collect();
+        let now = util::now();
         let mut n = 0;
         for s in list {
-            if !known.contains(&s.id) {
+            let buried = st.grave.get(&s.id).is_some_and(|t| now.saturating_sub(*t) < store::GRAVE_TTL);
+            if !known.contains(&s.id) && !buried {
                 st.servers.push(s);
                 n += 1;
             }
         }
         n
+    }
+
+    /// Working servers the relay servers of `lists` dial through (copies without relay).
+    fn relay_hop_servers(&self, lists: &[&[Server]]) -> Vec<Server> {
+        let ids: std::collections::BTreeSet<&String> = lists.iter().flat_map(|l| l.iter()).filter_map(|s| s.relay.as_ref()).collect();
+        let st = self.st.lock().unwrap();
+        ids.into_iter()
+            .filter_map(|id| st.servers.iter().find(|s| &s.id == id && s.relay.is_none()))
+            .cloned()
+            .collect()
+    }
+
+    /// `scan::check` that sends servers with an entry hop through `scan::check_relay`.
+    async fn check_split(&self, env: &scan::Env, list: Vec<Server>, o: &scan::Opts, net: &mut NetInfo, count: bool) -> Vec<Server> {
+        let (relay, direct): (Vec<Server>, Vec<Server>) = list.into_iter().partition(|s| s.relay.is_some());
+        let mut out = if direct.is_empty() { Vec::new() } else { scan::check(env, direct, o, net, |b| self.merge_with(b, count)).await };
+        if !relay.is_empty() && !env.cancel.load(Ordering::Relaxed) {
+            let hops = {
+                let st = self.st.lock().unwrap();
+                let mut hops: Vec<Server> = Vec::new();
+                for s in &relay {
+                    if let Some(h) = s.relay.as_ref().and_then(|id| st.servers.iter().find(|x| &x.id == id && x.good() && x.relay.is_none())) {
+                        if !hops.iter().any(|x| x.id == h.id) {
+                            hops.push(h.clone());
+                        }
+                    }
+                }
+                for h in scan::relay_hops(&st.servers, 3) {
+                    if !hops.iter().any(|x| x.id == h.id) {
+                        hops.push(h);
+                    }
+                }
+                hops
+            };
+            out.extend(scan::check_relay(env, relay, hops, o, net, |b| self.merge_with(b, count)).await);
+        }
+        out
     }
 
     fn countries(st: &State) -> HashSet<String> {
@@ -586,6 +662,7 @@ impl Engine {
             &st.servers,
             &scan::PoolOpts { size: st.settings.pool_size, countries: &cc, warp: st.settings.warp, selected: st.settings.selected.as_deref() },
         );
+        p.retain(|s| scan::relay_ok(&st.servers, s));
         let class = |s: &Server| if s.fav { 0 } else if s.origin == Origin::Mine { 1 } else { 2 };
         let auto_on = st.settings.selected.is_none() && st.conn.state == ConnState::On;
         if let (true, Some(cur)) = (auto_on, st.conn.current.as_deref()) {
@@ -756,11 +833,14 @@ impl Engine {
                 let st = self.st.lock().unwrap();
                 Ok(serde_json::to_value(&st.settings).unwrap_or(Value::Null))
             }
+            Req::UpdateCheck => self.update_check().await,
+            Req::UpdateMihomo => self.update_mihomo().await,
+            Req::UpdateProgram => self.update_program().await,
             Req::SetSettings { patch } => self.set_settings(patch).await,
             Req::Routes => Ok(self.routes_view()),
             Req::RouteDefault { target } => self.route_default(&target).await,
             Req::RouteAdd { name, target, sites, apps } => self.route_add(&name, &target, &sites, &apps).await,
-            Req::RouteUpdate { id, name, enabled, target, lists, fallback } => self.route_update(&id, name, enabled, target, lists, fallback).await,
+            Req::RouteUpdate { id, name, enabled, target, lists, fallback, strategy } => self.route_update(&id, name, enabled, target, lists, fallback, strategy).await,
             Req::RouteRemove { id } => self.route_remove(&id).await,
             Req::RouteMove { id, delta } => self.route_move(&id, delta).await,
             Req::RouteEntryAdd { id, kind, value } => self.route_entry_add(&id, kind, &value).await,
@@ -872,6 +952,10 @@ impl Engine {
             if let Some((u, d, _)) = api.totals().await {
                 let mut st = self.st.lock().unwrap();
                 let now = Instant::now();
+                // lifetime totals: the growth since the last reading (counters restart with mihomo)
+                let (lu0, ld0) = st.traffic.last.map(|(_, a, b)| (a, b)).unwrap_or((0, 0));
+                st.settings.traffic_up += if u >= lu0 { u - lu0 } else { u };
+                st.settings.traffic_down += if d >= ld0 { d - ld0 } else { d };
                 if let Some((t, lu, ld)) = st.traffic.last {
                     let dt = now.duration_since(t).as_secs_f64().max(0.2);
                     st.traffic.up = ((u.saturating_sub(lu)) as f64 / dt) as u64;
@@ -880,6 +964,13 @@ impl Engine {
                 st.traffic.last = Some((now, u, d));
                 st.traffic.up_total = u;
                 st.traffic.down_total = d;
+                // one tiny write a minute at most; a clean disconnect saves too
+                if st.traffic.saved.is_none_or(|t| t.elapsed() > Duration::from_secs(60)) {
+                    st.traffic.saved = Some(now);
+                    let snapshot = st.settings.clone();
+                    drop(st);
+                    let _ = store::save(&self.paths.settings(), &snapshot);
+                }
             }
         }
         let pool = self.pool();
@@ -903,6 +994,8 @@ impl Engine {
             down: if connected { st.traffic.down } else { 0 },
             up_total: st.traffic.up_total,
             down_total: st.traffic.down_total,
+            up_all: st.settings.traffic_up,
+            down_all: st.settings.traffic_down,
             user_cc: st.net.user_cc.clone(),
             routes_default: if routes.default == Target::Direct { "direct".into() } else { "vpn".into() },
             routes_on: routes.units().len(),
@@ -914,6 +1007,8 @@ impl Engine {
             countries_ok,
             notice_id: st.notice.0,
             notice: st.notice.1.clone(),
+            update_program: st.update.program.as_ref().map(|r| r.version.clone()).unwrap_or_default(),
+            update_mihomo: st.update.mihomo.as_ref().map(|r| r.version.clone()).unwrap_or_default(),
         }
     }
 
@@ -994,9 +1089,13 @@ impl Engine {
     fn write_run_files(&self, pool: &[Server], extra: &[Server]) -> Result<(), String> {
         let run = self.paths.run();
         std::fs::create_dir_all(&run).map_err(|e| e.to_string())?;
-        let refs: Vec<&Server> = pool.iter().collect();
+        // a relay server whose hop is gone would make the whole configuration invalid
+        let hop_ids: HashSet<String> = self.relay_hop_servers(&[pool, extra]).into_iter().map(|h| h.id).collect();
+        let runnable = |s: &&Server| s.relay.as_ref().is_none_or(|r| hop_ids.contains(r));
+        let refs: Vec<&Server> = pool.iter().filter(runnable).collect();
         mihomo::write_atomic(&run.join("pool.yaml"), mihomo::pool_file(&refs).as_bytes()).map_err(|e| e.to_string())?;
-        self.write_extra(extra)?;
+        let extra_ok: Vec<Server> = extra.iter().filter(|s| runnable(s)).cloned().collect();
+        self.write_extra(&extra_ok)?;
         let ids: Vec<String> = self.st.lock().unwrap().settings.routes.units().iter().map(|r| r.id.clone()).collect();
         self.write_route_lists(&ids)?;
         // lists of removed or disabled routes
@@ -1018,6 +1117,7 @@ impl Engine {
         }
         let (plans, extra, chains, default_chain) = self.route_plans(&pool);
         self.write_run_files(&pool, &extra)?;
+        let hops = self.relay_hop_servers(&[&pool, &extra]);
         let (opts, selected) = {
             let st = self.st.lock().unwrap();
             let s = &st.settings;
@@ -1029,6 +1129,7 @@ impl Engine {
                     default_chain,
                     routes: plans,
                     chains,
+                    hops,
                     stack: s.stack.clone(),
                     strict_route: s.strict_route,
                     ipv6: s.ipv6,
@@ -1142,9 +1243,11 @@ impl Engine {
     async fn apply_pool(self: &Arc<Self>) {
         let pool = self.pool();
         let (plans, extra, chains, default_chain) = self.route_plans(&pool);
+        let hop_ids: Vec<String> = self.relay_hop_servers(&[&pool, &extra]).into_iter().map(|h| h.id).collect();
         let (same_plan, old_pool, old_extra) = {
             let a = self.applied.lock().unwrap();
-            (a.opts.as_ref().map(|o| o.routes == plans && o.chains == chains && o.default_chain == default_chain).unwrap_or(true), a.pool.clone(), a.extra.clone())
+            let same = a.opts.as_ref().map(|o| o.routes == plans && o.chains == chains && o.default_chain == default_chain && o.hops.iter().map(|h| &h.id).eq(hop_ids.iter())).unwrap_or(true);
+            (same, a.pool.clone(), a.extra.clone())
         };
         if !same_plan && self.connected() {
             let _ = self.reload_main().await;
@@ -1222,6 +1325,12 @@ impl Engine {
             }
             if let Some(v) = patch.get("pool_size").and_then(|v| v.as_u64()) {
                 s.pool_size = (v as usize).clamp(2, 30);
+            }
+            if let Some(v) = patch.get("relay_scan").and_then(|v| v.as_bool()) {
+                s.relay_scan = v;
+            }
+            if let Some(v) = patch.get("auto_update").and_then(|v| v.as_bool()) {
+                s.auto_update = v;
             }
             if let Some(v) = patch.get("sort").and_then(|v| v.as_str()) {
                 if matches!(v, "best" | "ping" | "speed" | "stable") {
@@ -1412,7 +1521,7 @@ impl Engine {
             let env = self.scan_env();
             let mut net = self.st.lock().unwrap().net.clone();
             let opts = scan::Opts { target_good: 0, speed_top: 2, ..Default::default() };
-            let res = scan::check(&env, list, &opts, &mut net, |b| self.merge(b)).await;
+            let res = self.check_split(&env, list, &opts, &mut net, true).await;
             // speeds are measured after the batch callback
             self.merge_with(&res, false);
             self.st.lock().unwrap().net = net;
@@ -1476,7 +1585,7 @@ impl Engine {
             st.servers.iter().filter(|s| (s.origin == Origin::Mine || (s.fav && s.origin == Origin::Free)) && !busy.contains(&s.id)).cloned().collect()
         };
         if !mine.is_empty() {
-            scan::check(&env, mine, &base, &mut net, |b| self.merge(b)).await;
+            self.check_split(&env, mine, &base, &mut net, true).await;
         }
         // 2. WARP
         if settings.warp && !env.cancel.load(Ordering::Relaxed) {
@@ -1512,7 +1621,7 @@ impl Engine {
                     .collect()
             };
             if !stale.is_empty() {
-                scan::check(&env, stale, &base, &mut net, |b| self.merge_with(b, false)).await;
+                self.check_split(&env, stale, &base, &mut net, false).await;
                 self.save_servers();
             }
         }
@@ -1573,14 +1682,33 @@ impl Engine {
             };
             let need = if full { 0 } else { target.saturating_sub(good_free()).max(1) };
             let opts = scan::Opts { target_good: need, ..base.clone() };
-            let tested = scan::check(&env, plan, &opts, &mut net, |b| {
-                self.merge(b);
-            })
-            .await;
+            let tested = self.check_split(&env, plan, &opts, &mut net, true).await;
             self.log(&format!("уровень {tier}: проверено {}; {}", tested.len(), scan::reasons(&tested)));
             self.save_servers();
             if self.connected() {
                 self.apply_pool().await;
+            }
+        }
+        // 4b. entry hops: servers that do not answer from here (port closed, no reply)
+        // often work through a server that does — the path to them is what is blocked
+        if !env.cancel.load(Ordering::Relaxed) && settings.relay_scan {
+            let enough = {
+                let st = self.st.lock().unwrap();
+                !full && st.servers.iter().filter(|s| s.origin == Origin::Free && s.good() && scan::in_countries(s, &want)).count() >= target * 2
+            };
+            let (hops, cands) = {
+                let st = self.st.lock().unwrap();
+                (scan::relay_hops(&st.servers, 3), scan::relay_candidates(&st.servers, util::now(), if full { 600 } else { 300 }, 12 * 3600))
+            };
+            if !enough && !hops.is_empty() && !cands.is_empty() {
+                let n = cands.len();
+                let res = scan::check_relay(&env, cands, hops, &base, &mut net, |b| self.merge_with(b, false)).await;
+                let ok = res.iter().filter(|s| s.relay.is_some() && s.good()).count();
+                self.log(&format!("через входное звено: проверено {n}, ожили {ok}"));
+                self.save_servers();
+                if self.connected() {
+                    self.apply_pool().await;
+                }
             }
         }
         // 5. speed of the five best (the ones AUTO will use). Background searches only
@@ -1643,7 +1771,7 @@ impl Engine {
             let env = self.scan_env();
             let mut net = self.st.lock().unwrap().net.clone();
             let opts = scan::Opts { target_good: 0, speed_top: 0, services: true, ..Default::default() };
-            scan::check(&env, list, &opts, &mut net, |b| self.merge(b)).await;
+            self.check_split(&env, list, &opts, &mut net, true).await;
             self.st.lock().unwrap().net = net;
             self.save_servers();
         }
@@ -1690,7 +1818,11 @@ impl Engine {
         };
         let mut net = self.st.lock().unwrap().net.clone();
         let opts = scan::Opts { target_good: 0, speed_top: 1, ..Default::default() };
-        let res = scan::check(&env, vec![server], &opts, &mut net, |_| {}).await;
+        let res = if server.relay.is_some() {
+            self.check_split(&env, vec![server], &opts, &mut net, false).await
+        } else {
+            scan::check(&env, vec![server], &opts, &mut net, |_| {}).await
+        };
         let Some(s) = res.into_iter().next() else { return Err("не удалось проверить сервер".into()) };
         self.merge_with(std::slice::from_ref(&s), false);
         self.st.lock().unwrap().net = net;

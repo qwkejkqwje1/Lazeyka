@@ -78,6 +78,8 @@ pub struct RoutePlan {
     pub id: String,
     pub via: Via,
     pub spare: Spare,
+    /// How a country route picks among its servers.
+    pub strategy: crate::routes::Strategy,
 }
 
 impl RoutePlan {
@@ -178,6 +180,8 @@ pub struct MainOpts {
     pub routes: Vec<RoutePlan>,
     /// Chains referenced by the routes or the default target.
     pub chains: Vec<ChainPlan>,
+    /// Working servers that relay servers of the pool dial through (copies named `hop:<id>`).
+    pub hops: Vec<Server>,
     /// "gvisor" (default on Windows: no firewall prompts), "mixed", "system".
     pub stack: String,
     pub strict_route: bool,
@@ -217,6 +221,14 @@ pub fn main_config(o: &MainOpts) -> Value {
     // level N dials through the group of level N-1, so traffic enters level 1 and
     // leaves through the last level. An empty level is the VPN group itself.
     let mut chain_proxies: Vec<Value> = Vec::new();
+    for h in &o.hops {
+        let mut p = h.mihomo_proxy();
+        p["name"] = Value::from(crate::model::hop_name(&h.id));
+        if let Some(m) = p.as_object_mut() {
+            m.remove("dialer-proxy");
+        }
+        chain_proxies.push(p);
+    }
     for c in &o.chains {
         let last = c.levels.len();
         for (i, level) in c.levels.iter().enumerate() {
@@ -266,7 +278,7 @@ pub fn main_config(o: &MainOpts) -> Value {
         }
         if let Via::Servers(ids) = &r.via {
             let filter = format!("^(?:{})$", ids.iter().map(|i| regex_escape(i)).collect::<Vec<_>>().join("|"));
-            groups.push(json!({
+            let mut g = json!({
                 "name": route_servers_group(&r.id),
                 "type": "fallback",
                 "use": ["pool", "extra"],
@@ -278,7 +290,20 @@ pub fn main_config(o: &MainOpts) -> Value {
                 "max-failed-times": 2,
                 "expected-status": "204",
                 "empty-fallback": "REJECT"
-            }));
+            });
+            match r.strategy {
+                crate::routes::Strategy::Failover => {}
+                crate::routes::Strategy::Fastest => {
+                    g["type"] = Value::from("url-test");
+                    // do not jump between servers for a few milliseconds
+                    g["tolerance"] = Value::from(50);
+                }
+                crate::routes::Strategy::Balance => {
+                    g["type"] = Value::from("load-balance");
+                    g["strategy"] = Value::from("consistent-hashing");
+                }
+            }
+            groups.push(g);
             let mut chain_of = vec![route_servers_group(&r.id)];
             chain_of.extend(spare_chain(r, &mut groups));
             groups.push(json!({
@@ -875,6 +900,7 @@ mod tests {
             default_chain: None,
             routes: vec![],
             chains: vec![],
+            hops: vec![],
             stack: "gvisor".into(),
             strict_route: true,
             ipv6: true,
@@ -885,6 +911,37 @@ mod tests {
 
     fn ss(name: &str, port: u64) -> Value {
         json!({ "name": name, "type": "ss", "server": "127.0.0.1", "port": port, "cipher": "aes-128-gcm", "password": "x" })
+    }
+
+    #[test]
+    fn strategy_and_hops_config() {
+        let mk = |host: &str| {
+            let m: serde_json::Map<String, Value> = serde_json::from_value(ss("x", 8388)).unwrap();
+            let mut m = m;
+            m.insert("server".into(), Value::from(host));
+            Server::new(host, m, crate::model::Origin::Free, "t").unwrap()
+        };
+        let hop = mk("1.1.1.1");
+        let mut relay = mk("2.2.2.2");
+        relay.relay = Some(hop.id.clone());
+        let mut o = opts();
+        o.hops = vec![hop.clone()];
+        o.routes = vec![RoutePlan { id: "r1".into(), via: Via::Servers(vec![relay.id.clone()]), spare: Spare::Vpn, strategy: crate::routes::Strategy::Fastest }];
+        let cfg = main_config(&o);
+        let groups = cfg["proxy-groups"].as_array().unwrap();
+        let g = groups.iter().find(|g| g["name"] == route_servers_group("r1")).unwrap();
+        assert_eq!(g["type"], "url-test");
+        assert_eq!(g["tolerance"], 50);
+        o.routes[0].strategy = crate::routes::Strategy::Balance;
+        let cfg = main_config(&o);
+        let g = cfg["proxy-groups"].as_array().unwrap().iter().find(|g| g["name"] == route_servers_group("r1")).unwrap().clone();
+        assert_eq!(g["type"], "load-balance");
+        assert_eq!(g["strategy"], "consistent-hashing");
+        // the hop is a config-level proxy; the relay server in the pool dials through it
+        let names: Vec<&str> = cfg["proxies"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
+        assert_eq!(names, [format!("hop:{}", hop.id)]);
+        let pool: Value = serde_json::from_str(&pool_file(&[&relay])).unwrap();
+        assert_eq!(pool["proxies"][0]["dialer-proxy"], format!("hop:{}", hop.id));
     }
 
     #[test]
@@ -902,7 +959,7 @@ mod tests {
             levels: vec![vec![], vec![ss("nb~c1-2", 1002)], vec![ss("nc~c1-3", 1003), ss("nd~c1-3", 1004)]],
         }];
         o.default_chain = Some("c1".into());
-        o.routes = vec![RoutePlan { id: "r1".into(), via: Via::Chain("c1".into()), spare: Spare::Vpn }];
+        o.routes = vec![RoutePlan { id: "r1".into(), via: Via::Chain("c1".into()), spare: Spare::Vpn, strategy: Default::default() }];
         let v = main_config(&o);
         let groups: Vec<&Value> = v["proxy-groups"].as_array().unwrap().iter().collect();
         let by_name = |n: &str| groups.iter().find(|g| g["name"] == n).cloned().cloned();

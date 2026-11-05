@@ -45,7 +45,7 @@ impl Engine {
         match t {
             Target::Server(id) => st.servers.iter().filter(|s| &s.id == id).cloned().collect(),
             Target::Country(cc) => {
-                let mut v: Vec<&Server> = st.servers.iter().filter(|s| s.good() && s.country() == Some(cc.as_str())).collect();
+                let mut v: Vec<&Server> = st.servers.iter().filter(|s| s.good() && s.country() == Some(cc.as_str()) && scan::relay_ok(&st.servers, s)).collect();
                 v.sort_by_key(|s| (class(s), scan::score(s)));
                 let mut hosts = HashSet::new();
                 v.into_iter().filter(|s| hosts.insert(s.host.clone())).take(COUNTRY_SERVERS).cloned().collect()
@@ -210,7 +210,7 @@ impl Engine {
                     }
                 }
             }
-            plans.push(RoutePlan { id: r.id.clone(), via, spare });
+            plans.push(RoutePlan { id: r.id.clone(), via, spare, strategy: r.strategy });
         }
         let mut default_chain = None;
         if let Target::Chain(cid) = &st.settings.routes.default {
@@ -278,6 +278,7 @@ impl Engine {
                 opts.routes = plans;
                 opts.chains = chains;
                 opts.default_chain = default_chain;
+                opts.hops = self.relay_hop_servers(&[&pool, &extra]);
                 opts.default_direct = self.st.lock().unwrap().settings.routes.default == Target::Direct;
                 let written = self.write_run_files(&pool, &extra).and_then(|_| {
                     let cfg = mihomo::main_config(&opts);
@@ -402,6 +403,7 @@ impl Engine {
             "enabled": r.enabled,
             "target": r.target.code(),
             "fallback": r.fallback.code(),
+            "strategy": r.strategy.code(),
             "label": label(st, &r.target),
             "warn": warn,
             "sites": r.sites,
@@ -565,7 +567,7 @@ impl Engine {
     fn list_json(st: &State, l: &EntryList, connected: bool) -> Value {
         let (target, lbl, warn) = match &l.target {
             Some(t) => {
-                let unit = Route { id: routes::Routes::unit_id(&l.id), name: l.name.clone(), enabled: true, target: t.clone(), sites: l.sites.clone(), apps: l.apps.clone(), lists: vec![], fallback: l.fallback };
+                let unit = Route { id: routes::Routes::unit_id(&l.id), name: l.name.clone(), enabled: true, target: t.clone(), sites: l.sites.clone(), apps: l.apps.clone(), lists: vec![], fallback: l.fallback, strategy: l.strategy };
                 (t.code(), label(st, t), Self::target_warn(st, &unit, connected))
             }
             None => (String::new(), String::new(), String::new()),
@@ -731,8 +733,9 @@ impl Engine {
         Ok(Self::route_json(&st, &r, connected))
     }
 
-    pub(super) async fn route_update(self: &Arc<Self>, id: &str, name: Option<String>, enabled: Option<bool>, target: Option<String>, lists: Option<Vec<String>>, fallback: Option<String>) -> Result<Value, String> {
+    pub(super) async fn route_update(self: &Arc<Self>, id: &str, name: Option<String>, enabled: Option<bool>, target: Option<String>, lists: Option<Vec<String>>, fallback: Option<String>, strategy: Option<String>) -> Result<Value, String> {
         let target = target.map(|t| Self::parse_target(&t)).transpose()?;
+        let strategy = strategy.map(|f| routes::Strategy::parse(&f)).transpose()?;
         let fallback = fallback.map(|f| Fallback::parse(&f)).transpose()?;
         let mut want_warp_spare = false;
         let before = {
@@ -758,6 +761,9 @@ impl Engine {
             if let Some(f) = fallback {
                 r.fallback = f;
                 want_warp_spare = f == Fallback::Warp;
+            }
+            if let Some(x) = strategy {
+                r.strategy = x;
             }
             if let Some(e) = enabled {
                 r.enabled = e;
@@ -931,7 +937,7 @@ impl Engine {
                     (before, moved)
                 };
                 self.routes_changed(&before).await?;
-                self.route_update(&id, None, Some(true), Some(target.to_string()), None, None).await?;
+                self.route_update(&id, None, Some(true), Some(target.to_string()), None, None, None).await?;
                 let connected = self.connected();
                 let st = self.st.lock().unwrap();
                 let r = st.settings.routes.get(&id).cloned().ok_or("маршрут не найден")?;

@@ -123,6 +123,7 @@ struct RouteJs {
     target: String,
     /// "fastest" | "warp" | "direct" | "block".
     fallback: String,
+    strategy: String,
     label: String,
     warn: String,
     sites: Vec<String>,
@@ -233,6 +234,7 @@ fn route_item(r: &RouteJs, i: usize, n: usize) -> RouteItem {
         summary: ss(route_summary(r)),
         warn: ss(&r.warn),
         fallback: ss(if r.fallback.is_empty() { "fastest" } else { &r.fallback }),
+        strategy: ss(if r.strategy.is_empty() { "failover" } else { &r.strategy }),
         first: i == 0,
         last: i + 1 >= n,
     }
@@ -642,6 +644,8 @@ impl Ctl {
         };
         let (down, up) = (fmt_rate(st.down), fmt_rate(st.up));
         let totals = format!("↓ {} · ↑ {}", fmt_bytes(st.down_total), fmt_bytes(st.up_total));
+        let totals_all = if st.down_all + st.up_all == 0 { String::new() } else { format!("Всего через VPN: ↓ {} · ↑ {}", fmt_bytes(st.down_all), fmt_bytes(st.up_all)) };
+        let (upd_program, upd_mihomo) = (st.update_program.clone(), st.update_mihomo.clone());
         let route_default = if st.routes_default == "direct" { 1 } else { 0 };
         let set_default = self.sh.lock().unwrap().route_default_at.is_none_or(|t| t.elapsed() > Duration::from_secs(3));
         let (routes_on, routes_spare) = (st.routes_on as i32, st.routes_spare as i32);
@@ -663,6 +667,9 @@ impl Ctl {
             a.set_down(ss(down));
             a.set_up(ss(up));
             a.set_totals(ss(totals));
+            a.set_totals_all(ss(totals_all));
+            a.set_upd_program(ss(upd_program));
+            a.set_upd_mihomo(ss(upd_mihomo));
             a.set_scanning(scanning);
             a.set_scan_progress(progress);
             a.set_scan_text(ss(scan_text));
@@ -886,6 +893,7 @@ impl Ctl {
         let Ok(v) = self.call(json!({ "cmd": "settings" })).await else { return };
         let b = |k: &str, d: bool| v.get(k).and_then(Value::as_bool).unwrap_or(d);
         let (cos, warp, strict, ipv6) = (b("connect_on_start", false), b("warp", true), b("strict_route", true), b("ipv6", true));
+        let (auto_update, relay_scan) = (b("auto_update", true), b("relay_scan", true));
         let stack = v.get("stack").and_then(Value::as_str).and_then(|s| STACKS.iter().position(|x| *x == s)).unwrap_or(0) as i32;
         let sort = v.get("sort").and_then(Value::as_str).and_then(|s| SORTS.iter().position(|x| *x == s)).unwrap_or(0) as i32;
         let countries: Vec<String> =
@@ -908,6 +916,8 @@ impl Ctl {
             a.set_warp(warp);
             a.set_strict_route(strict);
             a.set_ipv6(ipv6);
+            a.set_auto_update(auto_update);
+            a.set_relay_scan(relay_scan);
             a.set_stack(stack);
             a.set_autostart(autostart);
             a.set_sort(sort);
@@ -1980,6 +1990,96 @@ impl Ctl {
         });
     }
 
+    fn set_upd_text(&self, text: impl Into<String>, busy: bool) {
+        let t: String = text.into();
+        self.ui(move |w| {
+            let a = w.global::<App>();
+            a.set_upd_text(ss(t));
+            a.set_upd_busy(busy);
+        });
+    }
+
+    fn check_updates(self: &Arc<Self>) {
+        let me = self.clone();
+        self.go(async move {
+            me.set_upd_text("Проверяем…", true);
+            match me.call(json!({ "cmd": "update_check" })).await {
+                Ok(v) => {
+                    let prog = v.get("program").is_some_and(|x| !x.is_null());
+                    let mih = v.get("mihomo").is_some_and(|x| !x.is_null());
+                    let text = if prog || mih { "Есть обновления" } else { "Установлена последняя версия" };
+                    me.set_upd_text(text, false);
+                }
+                Err(e) => {
+                    me.set_upd_text("", false);
+                    me.toast(e);
+                }
+            }
+            me.poke.notify_one();
+        });
+    }
+
+    fn install_mihomo_update(self: &Arc<Self>) {
+        let me = self.clone();
+        self.go(async move {
+            me.set_upd_text("Устанавливаем mihomo…", true);
+            let r = me.client.call_timeout(json!({ "cmd": "update_mihomo" }), Duration::from_secs(1000)).await;
+            match r {
+                Ok(_) => {
+                    me.set_upd_text("mihomo обновлён", false);
+                    me.toast("mihomo обновлён. Применится при следующем подключении");
+                }
+                Err(e) => {
+                    me.set_upd_text("", false);
+                    me.toast(e);
+                }
+            }
+            me.poke.notify_one();
+        });
+    }
+
+    /// Downloads the new package through the service and starts its `lazeyka.exe`: a copy
+    /// from another folder replaces this window and updates the service by itself.
+    fn install_program_update(self: &Arc<Self>) {
+        let me = self.clone();
+        self.go(async move {
+            me.set_upd_text("Загружаем…", true);
+            let r = me.client.call_timeout(json!({ "cmd": "update_program" }), Duration::from_secs(1000)).await;
+            let v = match r {
+                Ok(v) => v,
+                Err(e) => {
+                    me.set_upd_text("", false);
+                    me.toast(e);
+                    return;
+                }
+            };
+            let exe = std::path::PathBuf::from(v.get("exe").and_then(Value::as_str).unwrap_or(""));
+            let want = v.get("sha256").and_then(Value::as_str).unwrap_or("").to_string();
+            // the file must still be what the service unpacked
+            let ok = tokio::task::spawn_blocking({
+                let exe = exe.clone();
+                move || lazeyka_core::update::sha256_file(&exe).map(|h| h == want).unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
+            if !ok {
+                me.set_upd_text("", false);
+                me.toast("Файл обновления не прошёл проверку — установка отменена");
+                return;
+            }
+            me.set_upd_text("Запускаем установку…", true);
+            if cfg!(windows) {
+                if std::process::Command::new(&exe).spawn().is_err() {
+                    me.set_upd_text("", false);
+                    me.toast("Не удалось запустить установщик обновления");
+                }
+            } else {
+                me.set_upd_text("", false);
+                me.toast(format!("Обновление скачано: {}", exe.display()));
+            }
+        });
+    }
+
     fn open_dialog(self: &Arc<Self>, name: String) {
         let me = self.clone();
         if name == "target" {
@@ -2664,6 +2764,14 @@ fn wire(w: &AppWindow, ctl: &Arc<Ctl>) {
     a.on_route_toggle(move |id, on| c.route_cmd(json!({ "cmd": "route_update", "id": id.to_string(), "enabled": on })));
     let c = ctl.clone();
     a.on_route_fallback(move |id, fb| c.route_cmd(json!({ "cmd": "route_update", "id": id.to_string(), "fallback": fb.to_string() })));
+    let c = ctl.clone();
+    a.on_route_strategy(move |id, st| c.route_cmd(json!({ "cmd": "route_update", "id": id.to_string(), "strategy": st.to_string() })));
+    let c = ctl.clone();
+    a.on_check_updates(move || c.check_updates());
+    let c = ctl.clone();
+    a.on_install_program_update(move || c.install_program_update());
+    let c = ctl.clone();
+    a.on_install_mihomo_update(move || c.install_mihomo_update());
     let c = ctl.clone();
     a.on_route_sort(move || c.route_cmd(json!({ "cmd": "route_sort" })));
     let c = ctl.clone();

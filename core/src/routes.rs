@@ -126,6 +126,48 @@ impl<'de> Deserialize<'de> for Fallback {
     }
 }
 
+/// How a country route picks among its servers: `Failover` keeps the first working one
+/// (stable exit, the default), `Fastest` follows the lowest latency, `Balance` spreads
+/// connections over all of them (one site keeps one server).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Strategy {
+    #[default]
+    Failover,
+    Fastest,
+    Balance,
+}
+
+impl Strategy {
+    pub fn code(self) -> &'static str {
+        match self {
+            Strategy::Failover => "failover",
+            Strategy::Fastest => "fastest",
+            Strategy::Balance => "balance",
+        }
+    }
+    pub fn parse(s: &str) -> Result<Strategy, String> {
+        Ok(match s.trim() {
+            "failover" | "fallback" => Strategy::Failover,
+            "fastest" | "url-test" => Strategy::Fastest,
+            "balance" | "load-balance" => Strategy::Balance,
+            _ => return Err("неизвестная стратегия".into()),
+        })
+    }
+}
+
+impl Serialize for Strategy {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.code())
+    }
+}
+
+impl<'de> Deserialize<'de> for Strategy {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(Strategy::parse(&s).unwrap_or_default())
+    }
+}
+
 /// One hop of a chain. Traffic enters the first hop and leaves through the last
 /// one, so the exit country of a chain is the country of its last hop.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -235,6 +277,9 @@ pub struct Route {
     /// What happens when the target's own servers are not available.
     #[serde(default)]
     pub fallback: Fallback,
+    /// How the servers of a country are chosen (country targets only).
+    #[serde(default)]
+    pub strategy: Strategy,
     /// Domains (with subdomains), IPs and CIDRs, normalized by `split::normalize_site`.
     #[serde(default)]
     pub sites: Vec<String>,
@@ -248,7 +293,7 @@ pub struct Route {
 
 impl Route {
     pub fn new(name: &str, target: Target) -> Route {
-        Route { id: new_id(), name: clean_name(name), enabled: true, target, fallback: Fallback::default(), sites: vec![], apps: vec![], lists: vec![] }
+        Route { id: new_id(), name: clean_name(name), enabled: true, target, fallback: Fallback::default(), strategy: Strategy::default(), sites: vec![], apps: vec![], lists: vec![] }
     }
     pub fn list_mut(&mut self, apps: bool) -> &mut Vec<String> {
         if apps { &mut self.apps } else { &mut self.sites }
@@ -278,11 +323,13 @@ pub struct EntryList {
     pub target: Option<Target>,
     #[serde(default)]
     pub fallback: Fallback,
+    #[serde(default)]
+    pub strategy: Strategy,
 }
 
 impl EntryList {
     pub fn new(name: &str) -> EntryList {
-        EntryList { id: new_id(), name: clean_name(name), sites: vec![], apps: vec![], target: None, fallback: Fallback::default() }
+        EntryList { id: new_id(), name: clean_name(name), sites: vec![], apps: vec![], target: None, fallback: Fallback::default(), strategy: Strategy::default() }
     }
     pub fn list_mut(&mut self, apps: bool) -> &mut Vec<String> {
         if apps { &mut self.apps } else { &mut self.sites }
@@ -440,7 +487,7 @@ impl Routes {
         for l in self.lists.iter() {
             if let Some(t) = &l.target {
                 if l.entries() > 0 {
-                    out.push(Route { id: Self::unit_id(&l.id), name: l.name.clone(), enabled: true, target: t.clone(), fallback: l.fallback, sites: l.sites.clone(), apps: l.apps.clone(), lists: vec![] });
+                    out.push(Route { id: Self::unit_id(&l.id), name: l.name.clone(), enabled: true, target: t.clone(), fallback: l.fallback, strategy: l.strategy, sites: l.sites.clone(), apps: l.apps.clone(), lists: vec![] });
                 }
             }
         }
@@ -453,6 +500,9 @@ impl Routes {
             // the fallback policy is part of the configuration; the default adds nothing
             if r.fallback != Fallback::Fastest {
                 v.push((format!("fb:{}", r.id), Target::Chain(r.fallback.code().into())));
+            }
+            if r.strategy != Strategy::Failover {
+                v.push((format!("st:{}", r.id), Target::Chain(r.strategy.code().into())));
             }
             v.push((r.id, r.target));
         }
@@ -614,6 +664,25 @@ mod tests {
         let old: Routes = serde_json::from_str(r#"{"lists":[{"id":"l1","name":"X","sites":["a.com"]}]}"#).unwrap();
         assert_eq!(old.lists[0].target, None);
         assert!(old.units().is_empty());
+    }
+
+    #[test]
+    fn strategy_policy() {
+        assert_eq!(Strategy::parse("url-test").unwrap(), Strategy::Fastest);
+        assert!(Strategy::parse("x").is_err());
+        let old: Route = serde_json::from_str(r#"{"id":"a1"}"#).unwrap();
+        assert_eq!(old.strategy, Strategy::Failover);
+        let mut r = Routes::default();
+        let mut rt = Route::new("DE", Target::Country("DE".into()));
+        rt.sites.push("a.com".into());
+        let id = rt.id.clone();
+        r.list.push(rt);
+        let s1 = r.shape();
+        r.get_mut(&id).unwrap().strategy = Strategy::Balance;
+        assert_ne!(r.shape(), s1, "a new strategy needs a new configuration");
+        let j = serde_json::to_string(&r).unwrap();
+        assert!(j.contains(r#""strategy":"balance""#));
+        assert_eq!(serde_json::from_str::<Routes>(&j).unwrap().get(&id).unwrap().strategy, Strategy::Balance);
     }
 
     #[test]
