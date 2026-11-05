@@ -1,0 +1,72 @@
+name: Windows release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  TARGET: x86_64-pc-windows-gnullvm
+  LLVM_MINGW: "20261104"
+  MIHOMO: "1.19.33"
+
+jobs:
+  windows:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tests (core)
+        run: cargo test -p lazeyka-core --lib
+
+      - name: llvm-mingw
+        run: |
+          curl -fsSL -o llvm.tar.xz "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW}/llvm-mingw-${LLVM_MINGW}-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          mkdir -p "$HOME/llvm-mingw"
+          tar -xJf llvm.tar.xz -C "$HOME/llvm-mingw" --strip-components=1
+          echo "$HOME/llvm-mingw/bin" >> "$GITHUB_PATH"
+
+      - name: Build lazeyka.exe
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER: x86_64-w64-mingw32-clang
+          CC_x86_64_pc_windows_gnullvm: x86_64-w64-mingw32-clang
+        run: cargo build --release --target "$TARGET"
+
+      - name: mihomo and country database
+        run: |
+          curl -fsSL -o mihomo.zip "https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO}/mihomo-windows-amd64-compatible-v${MIHOMO}.zip"
+          unzip -o mihomo.zip
+          mv mihomo-windows-amd64-compatible.exe mihomo.exe 2>/dev/null || mv mihomo-windows-amd64*.exe mihomo.exe
+          for m in "$(date -u +%Y-%m)" "$(date -u -d '-1 month' +%Y-%m)" "$(date -u -d '-2 month' +%Y-%m)"; do
+            if curl -fsSL -o db.mmdb.gz "https://download.db-ip.com/free/dbip-country-lite-$m.mmdb.gz"; then break; fi
+          done
+          gunzip -f db.mmdb.gz
+          mv db.mmdb dbip-country-lite.mmdb
+
+      - name: Package
+        run: |
+          VER=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          tools/package-windows.sh mihomo.exe dbip-country-lite.mmdb "lazeyka-${VER}-windows-x64.zip"
+          echo "VER=$VER" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lazeyka-windows-x64
+          path: lazeyka-*-windows-x64.zip
+
+      - name: GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: lazeyka-*-windows-x64.zip
+          body_path: CHANGELOG.md
