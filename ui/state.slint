@@ -52,6 +52,8 @@ export struct RouteItem {
     summary: string,
     // why the route goes through the VPN for now ("" = fine)
     warn: string,
+    // when the chosen country has no working server: "fastest", "warp", "direct", "block"
+    fallback: string,
     first: bool,
     last: bool,
 }
@@ -263,6 +265,8 @@ export global App {
     callback search-lists(string);
     callback route-toggle(string, bool);
     callback route-move(string, int);
+    callback route-fallback(string, string);
+    callback route-sort();
     callback route-rename(string, string);
     callback route-delete(string);
     // kind 0 site, 1 program; for the open route

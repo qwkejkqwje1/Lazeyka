@@ -59,11 +59,14 @@ pub struct Opts {
     pub delay_timeout_ms: u32,
     /// Only servers exiting in these countries count towards `target_good` (empty = all).
     pub want_cc: HashSet<String>,
+    /// Cheap first stage: a plain TCP connect to servers that speak TCP; the closed ones
+    /// never reach the (expensive) lab. Only valid when probes go out directly.
+    pub prefilter: bool,
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Opts { batch: 256, parallel: 64, target_good: 12, services: true, udp: true, speed_top: 4, delay_timeout_ms: 5000, want_cc: HashSet::new() }
+        Opts { batch: 256, parallel: 64, target_good: 12, services: true, udp: true, speed_top: 4, delay_timeout_ms: 5000, want_cc: HashSet::new(), prefilter: false }
     }
 }
 
@@ -221,7 +224,12 @@ pub fn plan(
     for d in &srcs {
         let mut v = by_src.remove(d.id.as_str()).unwrap_or_default();
         // previously good first, then protocol rank, then shuffle-ish by id
-        v.sort_by_key(|s| (if s.good() { 0 } else { 1 }, proto_rank(s), s.fails, s.id.clone()));
+        // previously good first; then servers that appeared in the last day (fresh entries
+        // of a list live longest and have not been blocked yet); then DPI resistance
+        v.sort_by_key(|s| {
+            let fresh = now.saturating_sub(s.added) < 24 * 3600;
+            (if s.good() { 0 } else { 1 }, if fresh { 0 } else { 1 }, proto_rank(s), s.fails, std::cmp::Reverse(s.added), s.id.clone())
+        });
         v.truncate(d.cap);
         let (a, b): (Vec<&Server>, Vec<&Server>) = v.into_iter().partition(|s| prefer(s));
         queues.push((d.tier, a.into_iter().collect()));
@@ -254,6 +262,23 @@ pub fn plan(
         }
     }
     out
+}
+
+/// Why servers were rejected: "не отвечает ×1400, таймаут ×120 …", most frequent first.
+pub fn reasons(list: &[Server]) -> String {
+    let mut m: HashMap<String, usize> = HashMap::new();
+    let mut ok = 0usize;
+    for s in list {
+        match s.probe.as_ref() {
+            Some(p) if p.ok => ok += 1,
+            Some(p) => *m.entry(p.error.clone().unwrap_or_else(|| "без причины".into())).or_default() += 1,
+            None => {}
+        }
+    }
+    let mut v: Vec<(String, usize)> = m.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let rest: Vec<String> = v.iter().take(6).map(|(k, n)| format!("{k} ×{n}")).collect();
+    format!("рабочих {ok}; отказы: {}", if rest.is_empty() { "нет".to_string() } else { rest.join(", ") })
 }
 
 /// Server exits in one of `cc` (an empty set matches everything).
@@ -445,6 +470,51 @@ fn finalize_with(s: &mut Server, mut p: Probe, trace: Option<probe::Trace>, net:
     s.probe = Some(p);
 }
 
+fn is_udp_proto(s: &Server) -> bool {
+    matches!(s.proto, Proto::Hysteria2 | Proto::Tuic | Proto::Wireguard | Proto::Awg)
+        || s.proxy.get("network").and_then(|v| v.as_str()).is_some_and(|n| n == "quic" || n == "kcp")
+}
+
+/// Splits a batch into (worth testing, port closed). UDP-based protocols cannot be judged
+/// by a TCP connect and pass. If (almost) nothing answers the network itself is suspect:
+/// then nobody is dropped and the lab decides.
+async fn tcp_prefilter(batch: Vec<Server>) -> (Vec<Server>, Vec<Server>) {
+    let sem = Arc::new(tokio::sync::Semaphore::new(200));
+    let mut js = tokio::task::JoinSet::new();
+    let total = batch.len();
+    for (i, s) in batch.iter().enumerate() {
+        if is_udp_proto(s) {
+            continue;
+        }
+        let (host, port, sem) = (s.host.clone(), s.port, sem.clone());
+        js.spawn(async move {
+            let _p = sem.acquire_owned().await;
+            let ok = matches!(tokio::time::timeout(Duration::from_millis(3500), tokio::net::TcpStream::connect((host.as_str(), port))).await, Ok(Ok(_)));
+            (i, ok)
+        });
+    }
+    let mut closed: HashSet<usize> = HashSet::new();
+    let mut tested = 0usize;
+    while let Some(r) = js.join_next().await {
+        if let Ok((i, ok)) = r {
+            tested += 1;
+            if !ok {
+                closed.insert(i);
+            }
+        }
+    }
+    if tested >= 8 && closed.len() * 100 >= tested * 98 {
+        return (batch, Vec::new());
+    }
+    let _ = total;
+    let mut keep = Vec::new();
+    let mut dead = Vec::new();
+    for (i, s) in batch.into_iter().enumerate() {
+        if closed.contains(&i) { dead.push(s) } else { keep.push(s) }
+    }
+    (keep, dead)
+}
+
 /// Tests `list` in batches. Calls `on_batch` with each finished batch (for incremental saving).
 pub async fn check(env: &Env, list: Vec<Server>, o: &Opts, net: &mut NetInfo, mut on_batch: impl FnMut(&[Server])) -> Vec<Server> {
     {
@@ -468,6 +538,26 @@ pub async fn check(env: &Env, list: Vec<Server>, o: &Opts, net: &mut NetInfo, mu
         }
         let n = o.batch.min(queue.len());
         let mut batch: Vec<Server> = queue.drain(..n).collect();
+        if o.prefilter && batch.len() >= 8 {
+            env.stage("Быстрый отсев по TCP");
+            let (keep, dead) = tcp_prefilter(batch).await;
+            if !dead.is_empty() {
+                let mut pg = env.progress.lock().unwrap();
+                pg.done += dead.len();
+                drop(pg);
+                let mut fin = Vec::new();
+                for mut s in dead {
+                    finalize(&mut s, Probe { at: util::now(), error: Some("порт закрыт (TCP)".into()), ..Default::default() }, None, net, None);
+                    fin.push(s);
+                }
+                on_batch(&fin);
+                done.extend(fin);
+            }
+            batch = keep;
+            if batch.is_empty() {
+                continue;
+            }
+        }
         env.stage("Проверка серверов");
         // start lab, dropping proxies mihomo refuses to parse
         let mut lab = None;
@@ -739,6 +829,28 @@ mod tests {
         assert_eq!(cooldown(&s), 6 * 3600);
         s.oks = 1;
         assert_eq!(cooldown(&s), 3 * 3600);
+    }
+
+    #[test]
+    fn fresh_first_in_plan() {
+        let mut old = srv("1.1.1.1", Origin::Free, None);
+        let mut new = srv("2.2.2.2", Origin::Free, None);
+        old.added = 1_000;
+        new.added = 1_000_000;
+        let src = SourceDef { id: "t".into(), name: "t".into(), tier: 1, cap: 100, urls: vec![], enabled: true };
+        let p = plan(&[old, new], &[src], &HashMap::new(), 10, 1_000_100, &|_| false);
+        assert_eq!(p[0].host, "2.2.2.2");
+    }
+
+    #[test]
+    fn reasons_summary() {
+        let mut a = srv("a", Origin::Free, Some((50, "NL")));
+        let mut b = srv("b", Origin::Free, None);
+        let mut c = srv("c", Origin::Free, None);
+        b.probe = Some(Probe { at: 1, ok: false, error: Some("таймаут".into()), ..Default::default() });
+        c.probe = Some(Probe { at: 1, ok: false, error: Some("таймаут".into()), ..Default::default() });
+        a.probe.as_mut().unwrap().ok = true;
+        assert_eq!(reasons(&[a, b, c]), "рабочих 1; отказы: таймаут ×2");
     }
 
     #[test]

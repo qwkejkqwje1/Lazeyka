@@ -78,6 +78,54 @@ impl Target {
     }
 }
 
+/// What a route does when none of its own servers works (no server in the country yet,
+/// all of them down). Free servers come and go, so this is a real decision:
+/// `Fastest` — the best working VPN server right now (the default, never leaks);
+/// `Warp` — Cloudflare WARP first, then the fastest VPN (keeps access to blocked sites
+/// open while the search for the right country goes on — the exit country differs);
+/// `Direct` — straight out; `Block` — nothing leaves (strict geo-rules).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Fallback {
+    #[default]
+    Fastest,
+    Warp,
+    Direct,
+    Block,
+}
+
+impl Fallback {
+    pub fn code(self) -> &'static str {
+        match self {
+            Fallback::Fastest => "fastest",
+            Fallback::Warp => "warp",
+            Fallback::Direct => "direct",
+            Fallback::Block => "block",
+        }
+    }
+    pub fn parse(s: &str) -> Result<Fallback, String> {
+        Ok(match s.trim() {
+            "fastest" | "vpn" => Fallback::Fastest,
+            "warp" => Fallback::Warp,
+            "direct" => Fallback::Direct,
+            "block" => Fallback::Block,
+            _ => return Err("неизвестный запасной вариант".into()),
+        })
+    }
+}
+
+impl Serialize for Fallback {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.code())
+    }
+}
+
+impl<'de> Deserialize<'de> for Fallback {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(Fallback::parse(&s).unwrap_or_default())
+    }
+}
+
 /// One hop of a chain. Traffic enters the first hop and leaves through the last
 /// one, so the exit country of a chain is the country of its last hop.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,6 +232,9 @@ pub struct Route {
     pub enabled: bool,
     #[serde(default)]
     pub target: Target,
+    /// What happens when the target's own servers are not available.
+    #[serde(default)]
+    pub fallback: Fallback,
     /// Domains (with subdomains), IPs and CIDRs, normalized by `split::normalize_site`.
     #[serde(default)]
     pub sites: Vec<String>,
@@ -197,7 +248,7 @@ pub struct Route {
 
 impl Route {
     pub fn new(name: &str, target: Target) -> Route {
-        Route { id: new_id(), name: clean_name(name), enabled: true, target, sites: vec![], apps: vec![], lists: vec![] }
+        Route { id: new_id(), name: clean_name(name), enabled: true, target, fallback: Fallback::default(), sites: vec![], apps: vec![], lists: vec![] }
     }
     pub fn list_mut(&mut self, apps: bool) -> &mut Vec<String> {
         if apps { &mut self.apps } else { &mut self.sites }
@@ -225,11 +276,13 @@ pub struct EntryList {
     /// unit after the routes) without being attached anywhere.
     #[serde(default)]
     pub target: Option<Target>,
+    #[serde(default)]
+    pub fallback: Fallback,
 }
 
 impl EntryList {
     pub fn new(name: &str) -> EntryList {
-        EntryList { id: new_id(), name: clean_name(name), sites: vec![], apps: vec![], target: None }
+        EntryList { id: new_id(), name: clean_name(name), sites: vec![], apps: vec![], target: None, fallback: Fallback::default() }
     }
     pub fn list_mut(&mut self, apps: bool) -> &mut Vec<String> {
         if apps { &mut self.apps } else { &mut self.sites }
@@ -387,7 +440,7 @@ impl Routes {
         for l in self.lists.iter() {
             if let Some(t) = &l.target {
                 if l.entries() > 0 {
-                    out.push(Route { id: Self::unit_id(&l.id), name: l.name.clone(), enabled: true, target: t.clone(), sites: l.sites.clone(), apps: l.apps.clone(), lists: vec![] });
+                    out.push(Route { id: Self::unit_id(&l.id), name: l.name.clone(), enabled: true, target: t.clone(), fallback: l.fallback, sites: l.sites.clone(), apps: l.apps.clone(), lists: vec![] });
                 }
             }
         }
@@ -396,7 +449,13 @@ impl Routes {
 
     pub fn shape(&self) -> Vec<(String, Target)> {
         let mut v: Vec<(String, Target)> = vec![(String::new(), self.default.clone())];
-        v.extend(self.units().into_iter().map(|r| (r.id, r.target)));
+        for r in self.units() {
+            // the fallback policy is part of the configuration; the default adds nothing
+            if r.fallback != Fallback::Fastest {
+                v.push((format!("fb:{}", r.id), Target::Chain(r.fallback.code().into())));
+            }
+            v.push((r.id, r.target));
+        }
         // a chain's hops are part of the configuration even though routes only
         // name the chain: the hop codes ride in the Chain payload as a fingerprint
         v.extend(self.chains.iter().map(|c| {
@@ -555,6 +614,28 @@ mod tests {
         let old: Routes = serde_json::from_str(r#"{"lists":[{"id":"l1","name":"X","sites":["a.com"]}]}"#).unwrap();
         assert_eq!(old.lists[0].target, None);
         assert!(old.units().is_empty());
+    }
+
+    #[test]
+    fn fallback_policy() {
+        assert_eq!(Fallback::parse("warp").unwrap(), Fallback::Warp);
+        assert!(Fallback::parse("x").is_err());
+        let old: Route = serde_json::from_str(r#"{"id":"a1","target":"country:US"}"#).unwrap();
+        assert_eq!(old.fallback, Fallback::Fastest);
+        let bad: Route = serde_json::from_str(r#"{"id":"a1","fallback":"bogus"}"#).unwrap();
+        assert_eq!(bad.fallback, Fallback::Fastest);
+        let mut r = Routes::default();
+        let mut x = Route::new("X", Target::Country("US".into()));
+        x.sites.push("a.com".into());
+        let id = x.id.clone();
+        r.list.push(x);
+        let s1 = r.shape();
+        r.get_mut(&id).unwrap().fallback = Fallback::Warp;
+        assert_ne!(r.shape(), s1, "a new fallback needs a new configuration");
+        let j = serde_json::to_string(&r).unwrap();
+        assert!(j.contains(r#""fallback":"warp""#));
+        let back: Routes = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.get(&id).unwrap().fallback, Fallback::Warp);
     }
 
     #[test]

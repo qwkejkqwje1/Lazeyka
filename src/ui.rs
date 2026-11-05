@@ -121,6 +121,8 @@ struct RouteJs {
     name: String,
     enabled: bool,
     target: String,
+    /// "fastest" | "warp" | "direct" | "block".
+    fallback: String,
     label: String,
     warn: String,
     sites: Vec<String>,
@@ -230,6 +232,7 @@ fn route_item(r: &RouteJs, i: usize, n: usize) -> RouteItem {
         label: ss(&r.label),
         summary: ss(route_summary(r)),
         warn: ss(&r.warn),
+        fallback: ss(if r.fallback.is_empty() { "fastest" } else { &r.fallback }),
         first: i == 0,
         last: i + 1 >= n,
     }
@@ -2659,6 +2662,10 @@ fn wire(w: &AppWindow, ctl: &Arc<Ctl>) {
     a.on_search_lists(move |q| c.push_hits(&q.to_string()));
     let c = ctl.clone();
     a.on_route_toggle(move |id, on| c.route_cmd(json!({ "cmd": "route_update", "id": id.to_string(), "enabled": on })));
+    let c = ctl.clone();
+    a.on_route_fallback(move |id, fb| c.route_cmd(json!({ "cmd": "route_update", "id": id.to_string(), "fallback": fb.to_string() })));
+    let c = ctl.clone();
+    a.on_route_sort(move || c.route_cmd(json!({ "cmd": "route_sort" })));
     let c = ctl.clone();
     a.on_route_move(move |id, d| c.route_cmd(json!({ "cmd": "route_move", "id": id.to_string(), "delta": d })));
     let c = ctl.clone();

@@ -473,6 +473,42 @@ pub fn lint(routes: &Routes) -> Vec<Issue> {
     out
 }
 
+/// A better order of the routes: wherever a route holds a more specific entry than a
+/// route above it (same site narrower — `gemini.google.com` under `google.com` — or a smaller
+/// network) with another target, it moves up, since the first match wins. Everything else
+/// keeps its place. `None` when the order is already fine.
+pub fn autosort(routes: &Routes) -> Option<Vec<String>> {
+    let n = routes.list.len();
+    // before[i][j]: route j must come before route i
+    let mut must_precede: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, a) in routes.list.iter().enumerate() {
+        for (j, b) in routes.list.iter().enumerate() {
+            if i == j || a.target == b.target || !a.enabled || !b.enabled {
+                continue;
+            }
+            let narrower = routes.eff_list(b, false).iter().any(|e| {
+                routes.eff_list(a, false).iter().any(|x| x != e && entry_covers(x, e))
+            });
+            if narrower {
+                must_precede[i].push(j);
+            }
+        }
+    }
+    let mut placed = vec![false; n];
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    while order.len() < n {
+        let next = (0..n)
+            .find(|&i| !placed[i] && must_precede[i].iter().all(|&j| placed[j]))
+            .or_else(|| (0..n).find(|&i| !placed[i]));
+        let Some(i) = next else { break };
+        placed[i] = true;
+        order.push(i);
+    }
+    let ids: Vec<String> = order.into_iter().map(|i| routes.list[i].id.clone()).collect();
+    let cur: Vec<String> = routes.list.iter().map(|r| r.id.clone()).collect();
+    if ids == cur { None } else { Some(ids) }
+}
+
 /// True when `r` would not change anything (kept for UI code that wants a quick check).
 pub fn is_blank(routes: &Routes, r: &Route) -> bool {
     routes.eff_entries(r) == 0
@@ -557,6 +593,26 @@ mod tests {
         assert_eq!(e.hits.len(), 1);
         assert_eq!(explain(&r, "bad host").subject, Subject::Invalid);
         assert_eq!(explain(&r, "").subject, Subject::Invalid);
+    }
+
+    #[test]
+    fn autosort_moves_specific_up() {
+        let (mut r, a, b) = sample();
+        // sample: Gemini (specific) is already above Google: nothing to do
+        assert_eq!(autosort(&r), None);
+        r.list.reverse();
+        assert_eq!(autosort(&r), Some(vec![a.clone(), b.clone()]));
+        // an unrelated third route is not reordered relative to others unnecessarily
+        let mut c = Route::new("Другой", Target::Direct);
+        c.sites.push("example.org".into());
+        let cid = c.id.clone();
+        r.list.insert(1, c);
+        assert_eq!(autosort(&r), Some(vec![cid, a, b]));
+        // equal targets never conflict
+        let (mut r2, _, _) = sample();
+        r2.list.reverse();
+        r2.list[0].target = r2.list[1].target.clone();
+        assert_eq!(autosort(&r2), None);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! watch over route servers.
 
 use super::*;
-use crate::routes::{self, Chain, EntryList, Hop, Route, MAX_CHAINS, MAX_LISTS, MAX_ROUTES};
+use crate::routes::{self, Chain, EntryList, Fallback, Hop, Route, MAX_CHAINS, MAX_LISTS, MAX_ROUTES};
 use crate::{countries, smart, split};
 
 /// Servers of a country route (distinct hosts, best first).
@@ -126,29 +126,70 @@ impl Engine {
         let mut plans = Vec::new();
         let mut extra: Vec<Server> = Vec::new();
         let mut chains: Vec<mihomo::ChainPlan> = Vec::new();
-        let mut add_chain = |chains: &mut Vec<mihomo::ChainPlan>, cid: &str| -> bool {
+        let add_chain = |chains: &mut Vec<mihomo::ChainPlan>, cid: &str| -> bool {
             let Some(p) = st.settings.routes.chain(cid).and_then(|c| Self::chain_plan(&st, c)) else { return false };
             if !chains.iter().any(|x| x.id == p.id) {
                 chains.push(p);
             }
             true
         };
+        // WARP servers a route may fall back to (best first), shared by all routes
+        let warp_ids: Vec<String> = {
+            let mut v: Vec<&Server> = st.servers.iter().filter(|s| s.origin == Origin::Warp && s.good()).collect();
+            v.sort_by_key(|s| scan::score(s));
+            v.into_iter().take(WARP_SERVERS).map(|s| s.id.clone()).collect()
+        };
         for r in st.settings.routes.units() {
+            let spare = match r.fallback {
+                Fallback::Fastest => mihomo::Spare::Vpn,
+                Fallback::Direct => mihomo::Spare::Direct,
+                Fallback::Block => mihomo::Spare::Block,
+                Fallback::Warp => mihomo::Spare::Warp(warp_ids.clone()),
+            };
+            let mut need_warp = matches!(spare, mihomo::Spare::Warp(_));
+            // what the route does when it has nothing of its own to go through
+            let none_via = || match &spare {
+                mihomo::Spare::Direct => Via::Direct,
+                mihomo::Spare::Block => Via::Block,
+                _ => Via::Vpn,
+            };
             let via = match &r.target {
-                Target::Direct => Via::Direct,
-                Target::Vpn => Via::Vpn,
-                Target::Block => Via::Block,
+                Target::Direct => {
+                    need_warp = false;
+                    Via::Direct
+                }
+                Target::Vpn => {
+                    need_warp = false;
+                    Via::Vpn
+                }
+                Target::Block => {
+                    need_warp = false;
+                    Via::Block
+                }
                 Target::Chain(cid) => {
                     if add_chain(&mut chains, cid) {
                         Via::Chain(cid.clone())
                     } else {
-                        Via::Vpn
+                        none_via()
                     }
                 }
                 t => {
                     let list = Self::route_servers(&st, t);
                     if list.is_empty() {
-                        Via::Vpn
+                        // no own servers: WARP (if wanted and working) stands in, else the policy
+                        match (&spare, warp_ids.is_empty()) {
+                            (mihomo::Spare::Warp(_), false) => {
+                                for id in &warp_ids {
+                                    if let Some(s) = st.servers.iter().find(|s| &s.id == id) {
+                                        if !pool.iter().any(|x| x.id == s.id) && !extra.iter().any(|x| x.id == s.id) {
+                                            extra.push(s.clone());
+                                        }
+                                    }
+                                }
+                                Via::Servers(warp_ids.clone())
+                            }
+                            _ => none_via(),
+                        }
                     } else {
                         let ids = list.iter().map(|s| s.id.clone()).collect();
                         for s in list {
@@ -160,7 +201,16 @@ impl Engine {
                     }
                 }
             };
-            plans.push(RoutePlan { id: r.id.clone(), via });
+            if need_warp {
+                for id in &warp_ids {
+                    if let Some(s) = st.servers.iter().find(|s| &s.id == id) {
+                        if !pool.iter().any(|x| x.id == s.id) && !extra.iter().any(|x| x.id == s.id) {
+                            extra.push(s.clone());
+                        }
+                    }
+                }
+            }
+            plans.push(RoutePlan { id: r.id.clone(), via, spare });
         }
         let mut default_chain = None;
         if let Target::Chain(cid) = &st.settings.routes.default {
@@ -326,7 +376,12 @@ impl Engine {
                 },
                 t if t.uses_servers() && Self::route_servers(st, t).is_empty() => match t {
                     Target::Warp => "WARP пока недоступен — трафик идёт через VPN".into(),
-                    _ => "В этой стране нет рабочих серверов — трафик идёт через VPN".into(),
+                    _ => match r.fallback {
+                        Fallback::Fastest => "В этой стране нет рабочих серверов — трафик идёт через самый быстрый VPN".into(),
+                        Fallback::Warp => "В этой стране нет рабочих серверов — пока идёт через WARP, затем через VPN".into(),
+                        Fallback::Direct => "В этой стране нет рабочих серверов — трафик идёт напрямую".into(),
+                        Fallback::Block => "В этой стране нет рабочих серверов — трафик заблокирован".into(),
+                    },
                 },
                 _ => String::new(),
             }
@@ -346,6 +401,7 @@ impl Engine {
             "name": r.name,
             "enabled": r.enabled,
             "target": r.target.code(),
+            "fallback": r.fallback.code(),
             "label": label(st, &r.target),
             "warn": warn,
             "sites": r.sites,
@@ -509,7 +565,7 @@ impl Engine {
     fn list_json(st: &State, l: &EntryList, connected: bool) -> Value {
         let (target, lbl, warn) = match &l.target {
             Some(t) => {
-                let unit = Route { id: routes::Routes::unit_id(&l.id), name: l.name.clone(), enabled: true, target: t.clone(), sites: l.sites.clone(), apps: l.apps.clone(), lists: vec![] };
+                let unit = Route { id: routes::Routes::unit_id(&l.id), name: l.name.clone(), enabled: true, target: t.clone(), sites: l.sites.clone(), apps: l.apps.clone(), lists: vec![], fallback: l.fallback };
                 (t.code(), label(st, t), Self::target_warn(st, &unit, connected))
             }
             None => (String::new(), String::new(), String::new()),
@@ -675,8 +731,10 @@ impl Engine {
         Ok(Self::route_json(&st, &r, connected))
     }
 
-    pub(super) async fn route_update(self: &Arc<Self>, id: &str, name: Option<String>, enabled: Option<bool>, target: Option<String>, lists: Option<Vec<String>>) -> Result<Value, String> {
+    pub(super) async fn route_update(self: &Arc<Self>, id: &str, name: Option<String>, enabled: Option<bool>, target: Option<String>, lists: Option<Vec<String>>, fallback: Option<String>) -> Result<Value, String> {
         let target = target.map(|t| Self::parse_target(&t)).transpose()?;
+        let fallback = fallback.map(|f| Fallback::parse(&f)).transpose()?;
+        let mut want_warp_spare = false;
         let before = {
             let mut st = self.st.lock().unwrap();
             let before = st.settings.routes.clone();
@@ -697,6 +755,10 @@ impl Engine {
                     r.name = n;
                 }
             }
+            if let Some(f) = fallback {
+                r.fallback = f;
+                want_warp_spare = f == Fallback::Warp;
+            }
             if let Some(e) = enabled {
                 r.enabled = e;
             }
@@ -711,8 +773,38 @@ impl Engine {
         if let Some(t) = &target {
             self.want_warp(t);
         }
+        if want_warp_spare {
+            self.want_warp(&Target::Warp);
+        }
         self.routes_changed(&before).await?;
         Ok(Value::Null)
+    }
+
+    /// Countries that routes ask for but where no server works yet: the search looks
+    /// there first.
+    pub(super) fn missing_route_countries(&self) -> HashSet<String> {
+        let st = self.st.lock().unwrap();
+        let mut want: HashSet<String> = HashSet::new();
+        let mut add = |cc: &str| {
+            want.insert(cc.to_string());
+        };
+        for r in st.settings.routes.units() {
+            match &r.target {
+                Target::Country(cc) => add(cc),
+                Target::Chain(id) => {
+                    if let Some(c) = st.settings.routes.chain(id) {
+                        for h in &c.hops {
+                            if let Hop::Country(cc) = h {
+                                add(cc);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        want.retain(|cc| !st.servers.iter().any(|s| s.good() && s.country() == Some(cc.as_str())));
+        want
     }
 
     pub(super) async fn route_remove(self: &Arc<Self>, id: &str) -> Result<Value, String> {
@@ -839,7 +931,7 @@ impl Engine {
                     (before, moved)
                 };
                 self.routes_changed(&before).await?;
-                self.route_update(&id, None, Some(true), Some(target.to_string()), None).await?;
+                self.route_update(&id, None, Some(true), Some(target.to_string()), None, None).await?;
                 let connected = self.connected();
                 let st = self.st.lock().unwrap();
                 let r = st.settings.routes.get(&id).cloned().ok_or("маршрут не найден")?;
@@ -878,6 +970,22 @@ impl Engine {
         };
         self.routes_changed(&before).await?;
         Ok(json!({ "added": added, "found": b.sites.len() + b.apps.len(), "rejected": b.rejected.len(), "rejected_sample": b.rejected.iter().take(3).collect::<Vec<_>>(), "moved": moved }))
+    }
+
+    /// Reorders the routes so that specific rules win over the general ones.
+    pub(super) async fn route_sort(self: &Arc<Self>) -> Result<Value, String> {
+        let (before, moved) = {
+            let mut st = self.st.lock().unwrap();
+            let before = st.settings.routes.clone();
+            let Some(order) = smart::autosort(&st.settings.routes) else { return Ok(json!({ "moved": 0 })) };
+            let mut list = std::mem::take(&mut st.settings.routes.list);
+            let moved = order.iter().zip(list.iter()).filter(|(a, b)| **a != b.id).count();
+            list.sort_by_key(|r| order.iter().position(|x| *x == r.id).unwrap_or(usize::MAX));
+            st.settings.routes.list = list;
+            (before, moved)
+        };
+        self.routes_changed(&before).await?;
+        Ok(json!({ "moved": moved }))
     }
 
     /// "Where will this go?" in plain words.

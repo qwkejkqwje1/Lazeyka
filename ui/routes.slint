@@ -202,6 +202,10 @@ component RouteList inherits VerticalLayout {
                 wrap: word-wrap;
                 horizontal-stretch: 1;
             }
+            Btn {
+                text: "Упорядочить";
+                clicked => { App.route-sort(); }
+            }
         }
     }
     if App.routes.length > 0: SectionTitle {
@@ -327,6 +331,20 @@ component RouteEditor inherits VerticalLayout {
                 Text { text: App.route.label; color: Theme.text; font-size: 13.5px; font-weight: 600; overflow: elide; }
             }
             Icon { y: (parent.height - self.height) / 2; name: "chevron-right"; size: 16px; color: Theme.faint; }
+        }
+    }
+    if App.route.kind == "country": VerticalLayout {
+        spacing: 6px;
+        Text {
+            text: "Если в этой стране нет рабочих серверов:";
+            color: Theme.dim;
+            font-size: 11.5px;
+            x: 4px;
+        }
+        Segmented {
+            items: ["Быстрый", "WARP", "Напрямую", "Блок"];
+            current: App.route.fallback == "warp" ? 1 : App.route.fallback == "direct" ? 2 : App.route.fallback == "block" ? 3 : 0;
+            changed(i) => { App.route-fallback(App.route.id, i == 1 ? "warp" : i == 2 ? "direct" : i == 3 ? "block" : "fastest"); }
         }
     }
     if App.route.warn != "" && App.route.enabled: HorizontalLayout {

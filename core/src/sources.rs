@@ -27,6 +27,7 @@ fn igareck(file: &str) -> Vec<String> {
     let f = file.replace('+', "%2B");
     vec![
         format!("https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/{f}"),
+        format!("https://cdn.jsdelivr.net/gh/igareck/vpn-configs-for-russia@main/{f}"),
         format!("https://codeberg.org/igareck/vpn-configs-for-russia/raw/branch/main/{f}"),
         format!("https://gitlab.com/igareck/vpn-configs-for-russia/-/raw/main/{f}"),
         format!("https://bitbucket.org/igareck/vpn-configs-for-russia/raw/main/{f}"),
@@ -34,9 +35,17 @@ fn igareck(file: &str) -> Vec<String> {
     ]
 }
 
+/// jsDelivr serves GitHub files from a CDN that is often reachable when raw.githubusercontent.com is not.
+fn jsdelivr(repo: &str, path: &str) -> String {
+    let p = path.trim_start_matches("refs/heads/");
+    let (branch, rest) = p.split_once('/').unwrap_or(("main", p));
+    format!("https://cdn.jsdelivr.net/gh/{repo}@{branch}/{rest}")
+}
+
 fn gh(repo: &str, path: &str) -> Vec<String> {
     vec![
         format!("https://raw.githubusercontent.com/{repo}/{path}"),
+        jsdelivr(repo, path),
         format!("https://raw.githack.com/{repo}/{}", path.trim_start_matches("refs/heads/")),
     ]
 }
@@ -65,6 +74,11 @@ pub fn catalog() -> Vec<SourceDef> {
         def("mahan-vless", "MahanKenway · VLESS", 3, 200, gh("MahanKenway/Freedom-V2Ray", "main/configs/vless.txt"), true),
         def("danial-vless", "Danialsamadi · VLESS", 3, 200, gh("Danialsamadi/v2go", "main/Splitted-By-Protocol/vless.txt"), true),
         def("barry-vless", "barry-far · VLESS (большой)", 3, 300, gh("barry-far/V2ray-Config", "main/Splitted-By-Protocol/vless.txt"), true),
+        def("delta-vless", "Delta-Kronecker · VLESS", 3, 250, gh("Delta-Kronecker/V2ray-Config", "main/config/protocols/vless.txt"), true),
+        def("openray-vless", "OpenRay · VLESS (большой)", 3, 300, gh("sakha1370/OpenRay", "main/output/kind/vless.txt"), true),
+        def("rooster-raw", "roosterkid · смешанный", 3, 150, gh("roosterkid/openproxylist", "main/V2RAY_RAW.txt"), true),
+        def("mhdi-mix", "MhdiTaheri · смешанный", 3, 200, gh("MhdiTaheri/V2rayCollector_Py", "main/sub/Mix/mix.txt"), true),
+        def("aliilapro-all", "ALIILAPRO · смешанный (очень большой)", 3, 300, gh("ALIILAPRO/v2rayNG-Config", "main/server.txt"), false),
         def("soli-vless", "SoliSpirit · VLESS (большой)", 3, 300, gh("SoliSpirit/v2ray-configs", "refs/heads/main/Protocols/vless.txt"), false),
         def("radikal-all", "0xRadikal · все (очень большой)", 3, 300, gh("0xRadikal/Free-v2ray-Configs", "main/all/configs.txt"), false),
     ]

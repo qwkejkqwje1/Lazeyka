@@ -60,11 +60,24 @@ pub enum Via {
     Chain(String),
 }
 
+/// What a route falls back to when its own servers are not available.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum Spare {
+    /// The VPN group (best working pool server).
+    #[default]
+    Vpn,
+    Direct,
+    Block,
+    /// These WARP servers first, then the VPN.
+    Warp(Vec<String>),
+}
+
 /// One active route: its rule lists are `./routes/<id>-{apps,sites,ips}.txt`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RoutePlan {
     pub id: String,
     pub via: Via,
+    pub spare: Spare,
 }
 
 impl RoutePlan {
@@ -76,6 +89,33 @@ impl RoutePlan {
             Via::Block => "REJECT".into(),
             Via::Servers(_) => route_group(&self.id),
             Via::Chain(_) => route_group(&self.id),
+        }
+    }
+}
+
+/// The fallback tail of a route group, in order. A WARP spare adds its own group (to `groups`).
+fn spare_chain(r: &RoutePlan, groups: &mut Vec<Value>) -> Vec<String> {
+    match &r.spare {
+        Spare::Vpn => vec!["VPN".into()],
+        Spare::Direct => vec!["DIRECT".into()],
+        Spare::Block => vec!["REJECT".into()],
+        Spare::Warp(ids) if ids.is_empty() => vec!["VPN".into()],
+        Spare::Warp(ids) => {
+            let filter = format!("^(?:{})$", ids.iter().map(|i| regex_escape(i)).collect::<Vec<_>>().join("|"));
+            groups.push(json!({
+                "name": route_warp_group(&r.id),
+                "type": "fallback",
+                "use": ["pool", "extra"],
+                "filter": filter,
+                "url": TEST_URL,
+                "interval": 300,
+                "lazy": true,
+                "timeout": 5000,
+                "max-failed-times": 2,
+                "expected-status": "204",
+                "empty-fallback": "REJECT"
+            }));
+            vec![route_warp_group(&r.id), "VPN".into()]
         }
     }
 }
@@ -106,6 +146,10 @@ pub fn route_group(id: &str) -> String {
 /// The route's servers only (never empty: an empty filter result means REJECT, not DIRECT).
 pub fn route_servers_group(id: &str) -> String {
     format!("R-{id}-s")
+}
+/// The route's WARP spare (a group of the WARP servers only).
+pub fn route_warp_group(id: &str) -> String {
+    format!("R-{id}-w")
 }
 pub fn route_provider(id: &str, part: &str) -> String {
     format!("rt-{id}-{part}")
@@ -235,10 +279,12 @@ pub fn main_config(o: &MainOpts) -> Value {
                 "expected-status": "204",
                 "empty-fallback": "REJECT"
             }));
+            let mut chain_of = vec![route_servers_group(&r.id)];
+            chain_of.extend(spare_chain(r, &mut groups));
             groups.push(json!({
                 "name": route_group(&r.id),
                 "type": "fallback",
-                "proxies": [route_servers_group(&r.id), "VPN"],
+                "proxies": chain_of,
                 "url": TEST_URL,
                 "interval": 180,
                 "lazy": false,
@@ -248,10 +294,12 @@ pub fn main_config(o: &MainOpts) -> Value {
             }));
         }
         if let Via::Chain(cid) = &r.via {
+            let mut chain_of = vec![chain_group(cid)];
+            chain_of.extend(spare_chain(r, &mut groups));
             groups.push(json!({
                 "name": route_group(&r.id),
                 "type": "fallback",
-                "proxies": [chain_group(cid), "VPN"],
+                "proxies": chain_of,
                 "url": TEST_URL,
                 "interval": 180,
                 "lazy": false,
@@ -854,7 +902,7 @@ mod tests {
             levels: vec![vec![], vec![ss("nb~c1-2", 1002)], vec![ss("nc~c1-3", 1003), ss("nd~c1-3", 1004)]],
         }];
         o.default_chain = Some("c1".into());
-        o.routes = vec![RoutePlan { id: "r1".into(), via: Via::Chain("c1".into()) }];
+        o.routes = vec![RoutePlan { id: "r1".into(), via: Via::Chain("c1".into()), spare: Spare::Vpn }];
         let v = main_config(&o);
         let groups: Vec<&Value> = v["proxy-groups"].as_array().unwrap().iter().collect();
         let by_name = |n: &str| groups.iter().find(|g| g["name"] == n).cloned().cloned();

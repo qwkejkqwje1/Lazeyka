@@ -193,6 +193,9 @@ pub enum Req {
         /// Full set of attached entry-list ids, when given.
         #[serde(default)]
         lists: Option<Vec<String>>,
+        /// "fastest", "warp", "direct" or "block": what to do without own servers.
+        #[serde(default)]
+        fallback: Option<String>,
     },
     RouteRemove {
         id: String,
@@ -229,6 +232,8 @@ pub enum Req {
         id: String,
         text: String,
     },
+    /// Puts specific routes above the general ones that would hide them.
+    RouteSort,
     /// Where does this site or program go, and which rule decides?
     RouteExplain {
         query: String,
@@ -755,13 +760,14 @@ impl Engine {
             Req::Routes => Ok(self.routes_view()),
             Req::RouteDefault { target } => self.route_default(&target).await,
             Req::RouteAdd { name, target, sites, apps } => self.route_add(&name, &target, &sites, &apps).await,
-            Req::RouteUpdate { id, name, enabled, target, lists } => self.route_update(&id, name, enabled, target, lists).await,
+            Req::RouteUpdate { id, name, enabled, target, lists, fallback } => self.route_update(&id, name, enabled, target, lists, fallback).await,
             Req::RouteRemove { id } => self.route_remove(&id).await,
             Req::RouteMove { id, delta } => self.route_move(&id, delta).await,
             Req::RouteEntryAdd { id, kind, value } => self.route_entry_add(&id, kind, &value).await,
             Req::RouteEntryRemove { id, kind, value } => self.route_entry_remove(&id, kind, &value).await,
             Req::RouteImport { id, kind, text } => self.route_import(&id, kind, &text).await,
             Req::RouteExport { id, kind } => self.route_export(&id, kind),
+            Req::RouteSort => self.route_sort().await,
             Req::RoutePresets => Ok(self.route_presets()),
             Req::RoutePresetAdd { preset, target } => self.route_preset_add(&preset, &target).await,
             Req::RouteBulk { id, text } => self.route_bulk(&id, &text).await,
@@ -1461,7 +1467,9 @@ impl Engine {
         };
         let target = settings.scan_target;
         let want: HashSet<String> = settings.countries.iter().cloned().collect();
-        let base = scan::Opts { target_good: 0, speed_top: 0, want_cc: want.clone(), ..Default::default() };
+        // a plain TCP connect only means something when probes go out directly
+        let base = scan::Opts { target_good: 0, speed_top: 0, want_cc: want.clone(), prefilter: !self.connected(), ..Default::default() };
+        let route_cc = self.missing_route_countries();
         // 1. user's own and starred servers
         let mine: Vec<Server> = {
             let st = self.st.lock().unwrap();
@@ -1554,8 +1562,9 @@ impl Engine {
             // servers whose entry IP is in a chosen country are tested first
             let geo = env.geo.clone();
             let prefer = |s: &Server| {
-                want.is_empty()
-                    || s.host.parse::<std::net::IpAddr>().ok().and_then(|ip| geo.as_ref().and_then(|g| g.country(ip))).is_some_and(|c| want.contains(&c))
+                let cc = s.host.parse::<std::net::IpAddr>().ok().and_then(|ip| geo.as_ref().and_then(|g| g.country(ip)));
+                // countries the routes are waiting for come first, then the chosen ones
+                cc.as_ref().is_some_and(|c| route_cc.contains(c)) || want.is_empty() || cc.is_some_and(|c| want.contains(&c))
             };
             let plan = {
                 let st = self.st.lock().unwrap();
@@ -1564,10 +1573,11 @@ impl Engine {
             };
             let need = if full { 0 } else { target.saturating_sub(good_free()).max(1) };
             let opts = scan::Opts { target_good: need, ..base.clone() };
-            scan::check(&env, plan, &opts, &mut net, |b| {
+            let tested = scan::check(&env, plan, &opts, &mut net, |b| {
                 self.merge(b);
             })
             .await;
+            self.log(&format!("уровень {tier}: проверено {}; {}", tested.len(), scan::reasons(&tested)));
             self.save_servers();
             if self.connected() {
                 self.apply_pool().await;
