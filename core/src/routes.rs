@@ -178,6 +178,9 @@ pub enum Hop {
     Country(String),
     /// One server (id).
     Server(String),
+    /// Cloudflare WARP — usually the last hop: "VPN → WARP" exits with a clean
+    /// Cloudflare address and gets through where WARP itself is blocked.
+    Warp,
 }
 
 impl Hop {
@@ -187,7 +190,8 @@ impl Hop {
             Target::Vpn => Ok(Hop::Auto),
             Target::Country(cc) => Ok(Hop::Country(cc)),
             Target::Server(id) => Ok(Hop::Server(id)),
-            _ => Err("звено цепочки — сервер, страна или VPN".into()),
+            Target::Warp => Ok(Hop::Warp),
+            _ => Err("звено цепочки — сервер, страна, WARP или VPN".into()),
         }
     }
 
@@ -196,6 +200,7 @@ impl Hop {
             Hop::Auto => "vpn".into(),
             Hop::Country(cc) => format!("country:{cc}"),
             Hop::Server(id) => format!("server:{id}"),
+            Hop::Warp => "warp".into(),
         }
     }
 }
@@ -378,6 +383,29 @@ impl Routes {
         r
     }
 
+    /// Lists that carried their own direction (0.5–0.6) become ordinary routes with
+    /// the list attached: one place decides where traffic goes, lists are just folders.
+    /// The new routes go last, where the lists used to route. True when anything moved.
+    pub fn lists_to_routes(&mut self) -> bool {
+        let mut changed = false;
+        for l in self.lists.iter_mut() {
+            let Some(t) = l.target.take() else { continue };
+            changed = true;
+            if self.list.len() >= MAX_ROUTES {
+                continue;
+            }
+            let mut r = Route::new(&l.name, t);
+            if r.name.is_empty() {
+                r.name = "Список".into();
+            }
+            r.fallback = l.fallback;
+            r.strategy = l.strategy;
+            r.lists = vec![l.id.clone()];
+            self.list.push(r);
+        }
+        changed
+    }
+
     pub fn chain(&self, id: &str) -> Option<&Chain> {
         self.chains.iter().find(|c| c.id == id)
     }
@@ -550,7 +578,7 @@ mod tests {
             assert_eq!(Hop::parse(&h.code()).unwrap(), h);
         }
         assert!(Hop::parse("direct").is_err());
-        assert!(Hop::parse("warp").is_err());
+        assert_eq!(Hop::parse("warp").unwrap(), Hop::Warp);
         let r: Route = serde_json::from_str(r#"{"id":"a1","target":"bogus"}"#).unwrap();
         assert_eq!(r.target, Target::Vpn);
         assert!(r.enabled);
@@ -729,5 +757,23 @@ mod tests {
         assert_eq!(r.changed_lists(&before2), vec![ib.clone()]);
         assert!(r.add_entry("nope", false, "y.com").is_err());
         assert_eq!(clean_name("  Очень длинное название маршрута, которое не помещается никуда  ").chars().count(), MAX_NAME);
+    }
+
+    #[test]
+    fn list_directions_become_routes() {
+        let mut r = Routes::default();
+        let mut l = EntryList::new("Игры");
+        l.sites = vec!["steampowered.com".into()];
+        l.target = Some(Target::Direct);
+        let id = l.id.clone();
+        r.lists.push(l);
+        r.lists.push(EntryList::new("Без направления"));
+        assert!(r.lists_to_routes());
+        assert_eq!(r.list.len(), 1);
+        assert_eq!(r.list[0].target, Target::Direct);
+        assert_eq!(r.list[0].lists, vec![id]);
+        assert!(r.lists.iter().all(|l| l.target.is_none()));
+        assert_eq!(r.eff_entries(&r.list[0]), 1);
+        assert!(!r.lists_to_routes());
     }
 }

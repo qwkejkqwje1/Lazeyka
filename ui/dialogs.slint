@@ -654,8 +654,9 @@ component TargetRow inherits Rectangle {
 export component TargetKindsDialog inherits Modal {
     property <bool> edit: App.target-for != "";
     property <bool> list-mode: App.target-for.starts-with("@list:");
+    property <bool> quick-mode: App.target-for.starts-with("@quick:");
     property <string> kind: edit ? App.picker-kind : "";
-    title: edit ? "Направление" : "Новый маршрут";
+    title: root.quick-mode ? App.quick-value : root.list-mode ? "Куда отправить список" : edit ? "Направление" : "Новый маршрут";
     max-h: 660px;
     close => { App.dialog = ""; }
     VerticalLayout {
@@ -666,11 +667,11 @@ export component TargetKindsDialog inherits Modal {
             font-size: 12px;
             wrap: word-wrap;
         }
-        if root.list-mode: OptionRow {
-            title: "Не направлять отдельно";
-            subtitle: "Список работает только через маршруты, куда подключён";
-            checked: App.picker-target == "";
-            clicked => { App.pick-target(""); }
+        if root.list-mode: Text {
+            text: "Появится маршрут с этим списком — или список добавится в маршрут с таким направлением.";
+            color: Theme.dim;
+            font-size: 12px;
+            wrap: word-wrap;
         }
         OptionRow {
             title: "Напрямую";
@@ -705,7 +706,7 @@ export component TargetKindsDialog inherits Modal {
         }
         OptionRow {
             title: "Через WARP";
-            subtitle: "Cloudflare WARP";
+            subtitle: App.warp-note != "" ? "Cloudflare WARP · " + App.warp-note : "Cloudflare WARP";
             checked: root.kind == "warp";
             clicked => { App.pick-target("warp"); }
         }
@@ -1100,6 +1101,11 @@ export component HopKindsDialog inherits Modal {
             subtitle: "Один сервер из списка";
             clicked => { App.hop-step = 2; }
         }
+        OptionRow {
+            title: "WARP";
+            subtitle: "Cloudflare WARP через предыдущее звено: «VPN → WARP» проходит там, где WARP напрямую закрыт";
+            clicked => { App.pick-hop("warp"); }
+        }
     }
 }
 
@@ -1288,9 +1294,9 @@ export component ListEditDialog inherits Modal {
                     alignment: center;
                     spacing: 2px;
                     horizontal-stretch: 1;
-                    Text { text: "Направление списка"; color: Theme.dim; font-size: 11.5px; }
+                    Text { text: "Куда отправить список"; color: Theme.dim; font-size: 11.5px; }
                     Text {
-                        text: App.list-target-label == "" ? "Не задано — только через маршруты" : App.list-target-label;
+                        text: App.list-target-label == "" ? "Не подключён — выберите направление" : App.list-target-label;
                         color: Theme.text;
                         font-size: 13.5px;
                         font-weight: 600;

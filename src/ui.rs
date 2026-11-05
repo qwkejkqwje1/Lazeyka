@@ -894,6 +894,7 @@ impl Ctl {
         let b = |k: &str, d: bool| v.get(k).and_then(Value::as_bool).unwrap_or(d);
         let (cos, warp, strict, ipv6) = (b("connect_on_start", false), b("warp", true), b("strict_route", true), b("ipv6", true));
         let (auto_update, relay_scan) = (b("auto_update", true), b("relay_scan", true));
+        let warp_note = v.get("warp_note").and_then(Value::as_str).unwrap_or("").to_string();
         let stack = v.get("stack").and_then(Value::as_str).and_then(|s| STACKS.iter().position(|x| *x == s)).unwrap_or(0) as i32;
         let sort = v.get("sort").and_then(Value::as_str).and_then(|s| SORTS.iter().position(|x| *x == s)).unwrap_or(0) as i32;
         let countries: Vec<String> =
@@ -914,6 +915,7 @@ impl Ctl {
             let a = w.global::<App>();
             a.set_connect_on_start(cos);
             a.set_warp(warp);
+            a.set_warp_note(ss(warp_note));
             a.set_strict_route(strict);
             a.set_ipv6(ipv6);
             a.set_auto_update(auto_update);
@@ -954,6 +956,7 @@ impl Ctl {
         let has_chains = !chains.is_empty();
         let issues: Vec<String> = v.get("issues").and_then(|x| serde_json::from_value(x.clone()).ok()).unwrap_or_default();
         let issues_text = issues.iter().take(4).map(|t| format!("• {t}")).collect::<Vec<_>>().join("\n");
+        let warp_note = v.get("warp_note").and_then(Value::as_str).unwrap_or("").to_string();
         let set_default = {
             let mut sh = self.sh.lock().unwrap();
             sh.routes = list.clone();
@@ -978,6 +981,7 @@ impl Ctl {
             }
             a.set_has_chains(has_chains);
             a.set_route_issues(ss(issues_text));
+            a.set_warp_note(ss(warp_note));
             a.set_default_chain_name(ss(default_chain));
             with_models(|m| sync(&m.routes, items));
         });
@@ -1222,6 +1226,10 @@ impl Ctl {
         let me = self.clone();
         self.ui(|w| w.global::<App>().set_dialog(ss("")));
         self.go(async move {
+            if let Some(value) = for_id.strip_prefix("@quick:") {
+                me.route_quick(value.to_string(), code);
+                return;
+            }
             if let Some(preset) = for_id.strip_prefix("@preset:") {
                 if let Some(v) = me.act(json!({ "cmd": "route_preset_add", "preset": preset, "target": code })).await {
                     let id = v.get("id").and_then(Value::as_str).unwrap_or("").to_string();
@@ -1253,6 +1261,27 @@ impl Ctl {
             } else {
                 me.act(json!({ "cmd": "route_update", "id": for_id, "target": code })).await;
                 me.load_routes().await;
+            }
+            me.poke.notify_one();
+        });
+    }
+
+    /// Quick rule: the typed site or program goes to `code`; the explanation refreshes.
+    fn route_quick(self: &Arc<Self>, value: String, code: String) {
+        if value.trim().is_empty() {
+            return;
+        }
+        let me = self.clone();
+        self.go(async move {
+            match me.call(json!({ "cmd": "route_quick", "value": value, "target": code })).await {
+                Ok(v) => {
+                    let text = v.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+                    me.toast(text);
+                    me.load_routes().await;
+                    let ex = me.call(json!({ "cmd": "route_explain", "query": value })).await.ok().and_then(|v| v.get("text").and_then(Value::as_str).map(str::to_string)).unwrap_or_default();
+                    me.ui(move |w| w.global::<App>().set_explain_text(ss(ex)));
+                }
+                Err(e) => me.toast(e),
             }
             me.poke.notify_one();
         });
@@ -1387,6 +1416,8 @@ impl Ctl {
             sh.lists.iter().find(|l| l.id == id).map(|l| l.target.clone()).unwrap_or_default()
         } else if for_id == "@default" {
             sh.route_default_code.clone()
+        } else if for_id.starts_with("@quick:") {
+            String::new()
         } else if for_id.is_empty() {
             String::new()
         } else {
@@ -2670,6 +2701,8 @@ fn wire(w: &AppWindow, ctl: &Arc<Ctl>) {
     let c = ctl.clone();
     a.on_explain_route(move |q| {
         let q = q.to_string();
+        let qv = q.trim().to_string();
+        c.ui(move |w| w.global::<App>().set_quick_value(ss(qv)));
         let c2 = c.clone();
         c.go(async move {
             let text = match c2.call(json!({ "cmd": "route_explain", "query": q })).await {
@@ -2679,6 +2712,8 @@ fn wire(w: &AppWindow, ctl: &Arc<Ctl>) {
             c2.ui(move |w| w.global::<App>().set_explain_text(ss(text)));
         });
     });
+    let c = ctl.clone();
+    a.on_route_quick(move |value, code| c.route_quick(value.to_string(), code.to_string()));
     let c = ctl.clone();
     a.on_paste_bulk(move || match (sys::clipboard_get().filter(|t| !t.trim().is_empty()), c.route_id()) {
         (Some(t), Some(id)) => c.bulk_add(id, t),

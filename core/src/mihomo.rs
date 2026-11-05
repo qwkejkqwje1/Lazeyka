@@ -13,6 +13,9 @@ pub const TEST_URL: &str = "https://www.gstatic.com/generate_204";
 /// Second opinion before declaring a server dead (a server may block one test site).
 pub const ALT_TEST_URL: &str = "https://cp.cloudflare.com/generate_204";
 
+/// Where server lists and updates come from (see the LISTS rule of the main config).
+pub const LIST_HOSTS: &[&str] = &["githubusercontent.com", "github.com", "jsdelivr.net", "githack.com", "codeberg.org", "gitlab.com", "bitbucket.org"];
+
 /// Networks that always bypass the tunnel.
 pub const LAN: &[&str] = &[
     "10.0.0.0/8",
@@ -201,6 +204,10 @@ pub fn main_config(o: &MainOpts) -> Value {
     rules.push("DOMAIN-SUFFIX,lan,DIRECT".into());
     // Teredo (Windows IPv6 tunnelling) only produces failing UDP noise through a VPN
     rules.push("AND,((NETWORK,UDP),(DST-PORT,3544)),REJECT".into());
+    // Lazeyka itself fetches server lists and updates from code hostings that the network
+    // often slows down or blocks: through the tunnel while it works, else directly.
+    let hosts: Vec<String> = LIST_HOSTS.iter().map(|h| format!("(DOMAIN-SUFFIX,{h})")).collect();
+    rules.push(format!("AND,((PROCESS-NAME,lazeyka.exe),(OR,({}))),LISTS", hosts.join(",")));
     let mut rule_providers = serde_json::Map::new();
     let mut groups = vec![
         json!({
@@ -216,6 +223,15 @@ pub fn main_config(o: &MainOpts) -> Value {
             "empty-fallback": "REJECT"
         }),
         json!({ "name": "VPN", "type": "select", "proxies": ["AUTO"], "use": ["pool"] }),
+        json!({
+            "name": "LISTS",
+            "type": "fallback",
+            "proxies": ["VPN", "DIRECT"],
+            "url": TEST_URL,
+            "interval": 300,
+            "lazy": true,
+            "timeout": 5000
+        }),
     ];
     // Chains: every level is a fallback group of suffixed proxy copies; a copy of
     // level N dials through the group of level N-1, so traffic enters level 1 and

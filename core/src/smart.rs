@@ -184,6 +184,11 @@ pub struct Bulk {
 
 const MAX_BULK: usize = 20_000;
 
+/// A program name or path (`telegram.exe`, `C:\\…\\app.exe`) rather than a site.
+pub fn looks_app(t: &str) -> bool {
+    looks_like_app(t.trim())
+}
+
 fn looks_like_app(t: &str) -> bool {
     let l = t.to_ascii_lowercase();
     l.ends_with(".exe") || ((t.contains('\\') || t.starts_with("\"")) && (l.trim_end_matches('"').ends_with(".exe") || l.contains(".exe\"")))

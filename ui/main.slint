@@ -181,7 +181,9 @@ export component AppWindow inherits Window {
     if App.toast != "": Rectangle {
         x: 16px;
         width: root.width - 32px;
-        y: root.height - 64px - self.height - 12px;
+        // at the top and without a touch area: it must never cover or swallow the
+        // buttons of a dialog underneath (clicks pass through to them)
+        y: 12px;
         height: tt.preferred-height + 20px;
         border-radius: 12px;
         background: #2a303c;
@@ -197,7 +199,6 @@ export component AppWindow inherits Window {
             vertical-alignment: center;
             horizontal-alignment: center;
         }
-        TouchArea { clicked => { App.toast = ""; } }
     }
     Timer {
         interval: 3500ms;

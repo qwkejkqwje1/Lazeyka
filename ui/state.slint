@@ -178,6 +178,10 @@ export global App {
     in property <string> route-issues;
     // answer to "where will this go?"
     in property <string> explain-text;
+    // the site or program of the quick rule ("" = nothing typed yet)
+    in-out property <string> quick-value;
+    // WARP in one line: works / blocked here / off
+    in property <string> warp-note;
     in property <int> routes-on;
     in property <int> routes-spare;
     // route editor (shown instead of the list while route-open)
@@ -251,6 +255,8 @@ export global App {
     callback new-route();
     callback preset-pick(string);
     callback explain-route(string);
+    // value, target code: the site/program goes that way in one step
+    callback route-quick(string, string);
     callback paste-bulk();
     callback pick-target(string);
     // chains

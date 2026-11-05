@@ -256,6 +256,12 @@ pub enum Req {
     RouteExplain {
         query: String,
     },
+    /// "This site / program goes that way" in one step: the entry joins the route with
+    /// that direction (created when there is none) and leaves the others.
+    RouteQuick {
+        value: String,
+        target: String,
+    },
     RouteExport {
         id: String,
         kind: Kind,
@@ -438,6 +444,24 @@ const WARP_PAUSE: u64 = 6 * 3600;
 
 fn is_wg(s: &Server) -> bool {
     matches!(s.proto, Proto::Wireguard | Proto::Awg)
+}
+
+/// WARP in one line for the settings and the direction picker.
+fn warp_note(st: &State) -> String {
+    if !st.settings.warp {
+        return "Выключен: маршруты и цепочки через WARP пойдут через VPN".into();
+    }
+    let w: Vec<&Server> = st.servers.iter().filter(|s| s.origin == Origin::Warp).collect();
+    if w.is_empty() {
+        return "Ещё не подключался".into();
+    }
+    if w.iter().any(|s| s.good()) {
+        return "Работает".into();
+    }
+    if w.iter().any(|s| s.probe.is_some()) {
+        return "Напрямую не работает в вашей сети. Через VPN может пройти: цепочка «VPN → WARP»".into();
+    }
+    "Проверяется…".into()
 }
 
 impl Engine {
@@ -864,7 +888,11 @@ impl Engine {
             }
             Req::Settings => {
                 let st = self.st.lock().unwrap();
-                Ok(serde_json::to_value(&st.settings).unwrap_or(Value::Null))
+                let mut v = serde_json::to_value(&st.settings).unwrap_or(Value::Null);
+                if let Some(m) = v.as_object_mut() {
+                    m.insert("warp_note".into(), Value::from(warp_note(&st)));
+                }
+                Ok(v)
             }
             Req::UpdateCheck => self.update_check().await,
             Req::UpdateMihomo => self.update_mihomo().await,
@@ -885,6 +913,7 @@ impl Engine {
             Req::RoutePresetAdd { preset, target } => self.route_preset_add(&preset, &target).await,
             Req::RouteBulk { id, text } => self.route_bulk(&id, &text).await,
             Req::RouteExplain { query } => Ok(self.route_explain(&query)),
+            Req::RouteQuick { value, target } => self.route_quick(&value, &target).await,
             Req::ListAdd { name } => self.list_add(&name).await,
             Req::ListUpdate { id, name, target } => self.list_update(&id, name, target).await,
             Req::ListRemove { id } => self.list_remove(&id).await,

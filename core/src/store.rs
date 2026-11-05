@@ -152,14 +152,16 @@ impl Default for Settings {
 impl Settings {
     /// Converts settings of older versions. Returns true when something changed.
     pub fn migrate(&mut self) -> bool {
-        match self.split.take() {
+        let split = match self.split.take() {
             Some(sp) if self.routes == Routes::default() => {
                 self.routes = Routes::from_split(&sp);
                 true
             }
             Some(_) => true,
             None => false,
-        }
+        };
+        let lists = self.routes.lists_to_routes();
+        split || lists
     }
 
     /// Effective source list: built-in catalog with toggles + user-added lists.

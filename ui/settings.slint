@@ -44,7 +44,7 @@ export component SettingsPage inherits Rectangle {
                     VerticalLayout {
                         SettingRow {
                             title: "Cloudflare WARP";
-                            subtitle: "Запасной бесплатный сервер (AmneziaWG)";
+                            subtitle: App.warp && App.warp-note != "" ? "Запасной бесплатный сервер · " + App.warp-note : "Запасной бесплатный сервер (AmneziaWG)";
                             checked: App.warp;
                             toggled(v) => { App.set-flag("warp", v); }
                         }

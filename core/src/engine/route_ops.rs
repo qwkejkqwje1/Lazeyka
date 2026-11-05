@@ -35,6 +35,7 @@ fn hop_label(st: &State, h: &Hop) -> String {
             Some(s) => view(s, false).name,
             None => "удалён".into(),
         },
+        Hop::Warp => "WARP".into(),
     }
 }
 
@@ -81,6 +82,15 @@ impl Engine {
             Hop::Auto => vec![],
             Hop::Country(cc) => Self::route_servers(st, &Target::Country(cc.clone())),
             Hop::Server(id) => Self::route_servers(st, &Target::Server(id.clone())),
+            // One variant only: they all share one key, and a fallback group health-checks
+            // every member — several of them would knock each other's session out. Through
+            // an earlier hop WARP often works where it is blocked directly, so a variant
+            // that failed from here still qualifies (best record first).
+            Hop::Warp => {
+                let mut v: Vec<&Server> = st.servers.iter().filter(|s| s.origin == Origin::Warp).collect();
+                v.sort_by_key(|s| (!s.good(), scan::score(s), s.fails, s.id.clone()));
+                v.into_iter().take(1).cloned().collect()
+            }
         }
     }
 
@@ -346,6 +356,24 @@ impl Engine {
 
     /// Saves the routes and applies the change to a running connection.
     async fn routes_changed(self: &Arc<Self>, before: &Routes) -> Result<(), String> {
+        // Specific rules must sit above the general ones that would hide them: the order
+        // is fixed by itself after every edit except a deliberate move by the user.
+        {
+            let mut st = self.st.lock().unwrap();
+            let r = &st.settings.routes;
+            let mut a: Vec<&Route> = r.list.iter().collect();
+            let mut b: Vec<&Route> = before.list.iter().collect();
+            a.sort_by(|x, y| x.id.cmp(&y.id));
+            b.sort_by(|x, y| x.id.cmp(&y.id));
+            let only_moved = a == b;
+            if !only_moved {
+                if let Some(order) = smart::autosort(r) {
+                    let mut list = std::mem::take(&mut st.settings.routes.list);
+                    list.sort_by_key(|x| order.iter().position(|i| *i == x.id).unwrap_or(usize::MAX));
+                    st.settings.routes.list = list;
+                }
+            }
+        }
         self.save_settings();
         if !self.connected() {
             return Ok(());
@@ -453,6 +481,7 @@ impl Engine {
             "issues": smart::lint(&st.settings.routes).into_iter().map(|i| i.text).collect::<Vec<_>>(),
             "countries": countries,
             "warp": warp,
+            "warp_note": super::warp_note(&st),
         })
     }
 
@@ -503,8 +532,16 @@ impl Engine {
         hops.iter().map(|h| Hop::parse(h)).collect()
     }
 
+    /// A chain with a WARP hop needs the WARP device registered.
+    fn want_warp_hops(self: &Arc<Self>, hops: &[Hop]) {
+        if hops.contains(&Hop::Warp) {
+            self.want_warp(&Target::Warp);
+        }
+    }
+
     pub(super) async fn chain_add(self: &Arc<Self>, name: &str, hops: &[String]) -> Result<Value, String> {
         let hops = Self::parse_hops(hops)?;
+        self.want_warp_hops(&hops);
         let mut c = Chain::new(name, hops);
         if c.name.is_empty() {
             c.name = "Цепочка".into();
@@ -528,6 +565,9 @@ impl Engine {
 
     pub(super) async fn chain_update(self: &Arc<Self>, id: &str, name: Option<String>, hops: Option<Vec<String>>) -> Result<Value, String> {
         let hops = hops.map(|h| Self::parse_hops(&h)).transpose()?;
+        if let Some(h) = &hops {
+            self.want_warp_hops(h);
+        }
         let before = {
             let mut st = self.st.lock().unwrap();
             let before = st.settings.routes.clone();
@@ -570,7 +610,11 @@ impl Engine {
                 let unit = Route { id: routes::Routes::unit_id(&l.id), name: l.name.clone(), enabled: true, target: t.clone(), sites: l.sites.clone(), apps: l.apps.clone(), lists: vec![], fallback: l.fallback, strategy: l.strategy };
                 (t.code(), label(st, t), Self::target_warn(st, &unit, connected))
             }
-            None => (String::new(), String::new(), String::new()),
+            None => {
+                // a plain folder: tell where it is used instead
+                let used: Vec<String> = st.settings.routes.list.iter().filter(|r| r.lists.contains(&l.id)).map(|r| format!("«{}» ({})", r.name, label(st, &r.target))).collect();
+                (String::new(), if used.is_empty() { String::new() } else { format!("В маршрутах: {}", used.join(", ")) }, String::new())
+            }
         };
         json!({ "id": l.id, "name": l.name, "sites": l.sites, "apps": l.apps, "target": target, "label": lbl, "warn": warn })
     }
@@ -617,6 +661,8 @@ impl Engine {
             if let Some(t) = target {
                 l.target = t;
             }
+            // a direction for a list means a route with the list attached
+            st.settings.routes.lists_to_routes();
             before
         };
         self.routes_changed(&before).await?;
@@ -1015,6 +1061,50 @@ impl Engine {
             None => lines.push(format!("{what} → {}. Ни один маршрут не подошёл — действует «Остальной трафик».", label(&st, &ex.default))),
         }
         json!({ "ok": true, "text": lines.join("\n"), "target": ex.target().code() })
+    }
+
+    /// One-step rule: `value` (a site or a program) goes to `target`. The route that
+    /// already has that direction takes it (the first enabled one; a disabled one is
+    /// switched on only when it is the sole candidate), else a new route named after the
+    /// direction appears. The entry leaves every other route.
+    pub(super) async fn route_quick(self: &Arc<Self>, value: &str, target: &str) -> Result<Value, String> {
+        let t = Self::parse_target(target)?;
+        let v = value.trim();
+        let app = smart::looks_app(v);
+        let entry = if app { split::normalize_app(v)? } else { split::normalize_site(v)? };
+        let (before, id, name, created) = {
+            let mut st = self.st.lock().unwrap();
+            let before = st.settings.routes.clone();
+            let found = st.settings.routes.list.iter().find(|r| r.enabled && r.target == t).or_else(|| st.settings.routes.list.iter().find(|r| r.target == t)).map(|r| r.id.clone());
+            let (id, created) = match found {
+                Some(id) => (id, false),
+                None => {
+                    if st.settings.routes.list.len() >= MAX_ROUTES {
+                        return Err(format!("Можно создать не больше {MAX_ROUTES} маршрутов"));
+                    }
+                    let name = match &t {
+                        Target::Country(cc) => countries::name(cc).map(str::to_string).unwrap_or_else(|| cc.clone()),
+                        Target::Block => "Блокировка".into(),
+                        other => label(&st, other),
+                    };
+                    let r = Route::new(&name, t.clone());
+                    let id = r.id.clone();
+                    st.settings.routes.list.push(r);
+                    (id, true)
+                }
+            };
+            st.settings.routes.add_entry(&id, app, &entry)?;
+            if let Some(r) = st.settings.routes.get_mut(&id) {
+                r.enabled = true;
+            }
+            let name = st.settings.routes.get(&id).map(|r| r.name.clone()).unwrap_or_default();
+            (before, id, name, created)
+        };
+        self.want_warp(&t);
+        self.routes_changed(&before).await?;
+        let st = self.st.lock().unwrap();
+        let text = format!("{entry} → {} (маршрут «{name}»{})", label(&st, &t), if created { ", создан" } else { "" });
+        Ok(json!({ "id": id, "name": name, "created": created, "text": text }))
     }
 
     pub(super) fn route_export(&self, id: &str, kind: Kind) -> Result<Value, String> {
