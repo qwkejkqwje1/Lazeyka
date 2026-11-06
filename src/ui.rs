@@ -190,6 +190,9 @@ fn hop_label(sh: &Shared, code: &str) -> String {
     if code == "vpn" {
         return "VPN".into();
     }
+    if code == "warp" {
+        return "WARP".into();
+    }
     if let Some(cc) = code.strip_prefix("country:") {
         return country(cc);
     }
