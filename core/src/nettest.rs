@@ -345,7 +345,7 @@ pub async fn run(l: &Listener, key: String) -> NetProfile {
         p.dns_spoof = spoofed;
         // stalled after a few kilobytes while the domestic control (if it answered) went through
         let control_ok = matches!(home, Dl::Full | Dl::Cut(65536..));
-        let mut cut_hosts: Vec<String> = dl.iter().filter(|(_, r)| matches!(r, Dl::Cut(n) if *n < 64 * 1024)).map(|(n, _)| n.clone()).collect();
+        let mut cut_hosts: Vec<String> = dl.iter().filter(|(_, r)| matches!(r, Dl::Cut(n) if *n > 0 && *n < 64 * 1024)).map(|(n, _)| n.clone()).collect();
         cut_hosts.sort();
         let full = dl.iter().any(|(_, r)| *r == Dl::Full);
         p.cut = if !cut_hosts.is_empty() && control_ok { Some(true) } else if full { Some(false) } else { None };
@@ -418,7 +418,7 @@ pub fn lines(p: &NetProfile) -> Vec<(String, String, i8, String)> {
         },
         tri(p.cloudflare),
         if p.cloudflare == Some(false) {
-            "WARP напрямую не заработает — Лазейка его не проверяет и не тратит на это время. Серверы с адресами Cloudflare пропускаются. Через VPN WARP работает: цепочка «VPN → WARP».".into()
+            "WARP напрямую не заработает — Лазейка его не проверяет и не тратит на это время. Серверы с адресами Cloudflare пропускаются. Попробуйте WARP через VPN: цепочка «VPN → WARP».".into()
         } else {
             String::new()
         },

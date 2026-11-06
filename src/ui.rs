@@ -606,6 +606,7 @@ impl Ctl {
             ConnState::Off => st.message.clone().unwrap_or_else(|| "Нажмите кнопку, чтобы подключиться".into()),
         };
         let timer = if state == 2 && st.since > 0 { fmt_duration(now.saturating_sub(st.since)) } else { String::new() };
+        let standby = st.standby.as_ref().map(|s| s.name.clone()).unwrap_or_default();
         let (cur_name, cur_cc, cur_detail, cur_warp) = match &st.server {
             Some(s) => {
                 let mut parts: Vec<String> = Vec::new();
@@ -662,6 +663,7 @@ impl Ctl {
             a.set_state_text(ss(state_text));
             a.set_message(ss(message));
             a.set_timer(ss(timer));
+            a.set_standby(ss(standby));
             a.set_cur_name(ss(cur_name));
             a.set_cur_cc(ss(cur_cc));
             a.set_cur_detail(ss(cur_detail));
@@ -896,7 +898,7 @@ impl Ctl {
         let Ok(v) = self.call(json!({ "cmd": "settings" })).await else { return };
         let b = |k: &str, d: bool| v.get(k).and_then(Value::as_bool).unwrap_or(d);
         let (cos, warp, strict, ipv6) = (b("connect_on_start", false), b("warp", true), b("strict_route", true), b("ipv6", true));
-        let (auto_update, relay_scan) = (b("auto_update", true), b("relay_scan", true));
+        let (auto_update, relay_scan, https_only_free) = (b("auto_update", true), b("relay_scan", true), b("https_only_free", true));
         let net_summary = v.get("net_summary").and_then(Value::as_str).unwrap_or("").to_string();
         let warp_note = v.get("warp_note").and_then(Value::as_str).unwrap_or("").to_string();
         let stack = v.get("stack").and_then(Value::as_str).and_then(|s| STACKS.iter().position(|x| *x == s)).unwrap_or(0) as i32;
@@ -925,6 +927,7 @@ impl Ctl {
             a.set_ipv6(ipv6);
             a.set_auto_update(auto_update);
             a.set_relay_scan(relay_scan);
+            a.set_https_only_free(https_only_free);
             a.set_stack(stack);
             a.set_autostart(autostart);
             a.set_sort(sort);
@@ -953,12 +956,17 @@ impl Ctl {
             })
             .unwrap_or_default();
         let default = if default_code == "direct" { 1 } else { 0 };
+        let default_label = v["default_label"].as_str().unwrap_or("Через VPN").to_string();
+        let default_warn = v["default_warn"].as_str().unwrap_or("").to_string();
+        let (kind, cc) = route_kind(&default_code);
+        let default_kind = kind.to_string();
         let default_chain = default_code
             .strip_prefix("chain:")
             .and_then(|id| chains.iter().find(|c| c.id == id))
             .map(|c| c.name.clone())
             .unwrap_or_default();
         let has_chains = !chains.is_empty();
+        let warp_good = v["warp_good"].as_bool().unwrap_or(false);
         let issues: Vec<String> = v.get("issues").and_then(|x| serde_json::from_value(x.clone()).ok()).unwrap_or_default();
         let issues_text = issues.iter().take(4).map(|t| format!("• {t}")).collect::<Vec<_>>().join("\n");
         let warp_note = v.get("warp_note").and_then(Value::as_str).unwrap_or("").to_string();
@@ -984,7 +992,12 @@ impl Ctl {
             if set_default {
                 a.set_route_default(default);
             }
+            a.set_default_label(ss(default_label));
+            a.set_default_kind(ss(default_kind));
+            a.set_default_cc(ss(cc));
+            a.set_default_warn(ss(default_warn));
             a.set_has_chains(has_chains);
+            a.set_warp_good(warp_good);
             a.set_route_issues(ss(issues_text));
             a.set_warp_note(ss(warp_note));
             a.set_default_chain_name(ss(default_chain));
@@ -1293,6 +1306,19 @@ impl Ctl {
     }
 
     // -------------------------------------------------------------- chains
+
+    fn chain_template(self: &Arc<Self>, reverse: bool, for_id: String) {
+        let hops = if reverse { vec!["warp", "vpn"] } else { vec!["vpn", "warp"] };
+        let name = if reverse { "WARP → VPN" } else { "VPN → WARP" };
+        let existing = self.sh.lock().unwrap().chains.iter().find(|c| c.hops.iter().map(|h| h.code.as_str()).eq(hops.iter().copied())).map(|c| c.id.clone());
+        if let Some(id) = existing { self.pick_target(format!("chain:{id}"), for_id); return; }
+        let me = self.clone();
+        self.go(async move {
+            if let Some(v) = me.act(json!({"cmd":"chain_add", "name":name, "hops":hops})).await {
+                if let Some(id) = v["id"].as_str() { me.load_routes().await; me.pick_target(format!("chain:{id}"), for_id); }
+            }
+        });
+    }
 
     fn chain_new(self: &Arc<Self>) {
         self.sh.lock().unwrap().chain_draft = Some((String::new(), Vec::new()));
@@ -2771,8 +2797,10 @@ fn wire(w: &AppWindow, ctl: &Arc<Ctl>) {
     a.on_chain_edit(move |id| c.chain_edit(id.to_string()));
     let c = ctl.clone();
     a.on_chain_delete(move |id| c.chain_delete(id.to_string()));
-    let c = ctl.clone();
     let wk = weak.clone();
+    let c = ctl.clone();
+    a.on_chain_template(move |reverse, for_id| c.chain_template(reverse != 0, for_id.to_string()));
+    let c = ctl.clone();
     a.on_chain_save(move || {
         let name = wk.upgrade().map(|w| w.global::<App>().get_chain_name().to_string()).unwrap_or_default();
         c.chain_save(name);

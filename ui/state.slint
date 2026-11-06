@@ -128,6 +128,7 @@ export global App {
     in property <string> state-text: "Отключено";
     in property <string> message;
     in property <string> timer;
+    in property <string> standby;
     // engine link: 0 ok, 1 not installed, 2 stopped/unreachable, 3 installing, 4 needs update
     in property <int> service;
     in property <string> service-text;
@@ -149,6 +150,7 @@ export global App {
     in property <bool> upd-busy;
     in property <bool> auto-update: true;
     in property <bool> relay-scan: true;
+    in property <bool> https-only-free: true;
     callback check-updates();
     callback install-program-update();
     callback install-mihomo-update();
@@ -179,6 +181,10 @@ export global App {
     in property <bool> location-blocked;
     // routes: 0 — traffic without a route goes through the VPN, 1 — directly
     in-out property <int> route-default;
+    in property <string> default-label;
+    in property <string> default-kind;
+    in property <string> default-cc;
+    in property <string> default-warn;
     in property <[RouteItem]> routes;
     in property <[PresetItem]> presets;
     // problems found in the routes, one per line ("" = none)
@@ -209,6 +215,7 @@ export global App {
     // name of the chain the default target uses ("" = plain VPN or direct)
     in property <string> default-chain-name;
     in property <bool> has-chains;
+    in property <bool> warp-good;
     // chain editor draft (the name is edited in place, hops live in chain-hops)
     in-out property <string> chain-name;
     in property <[TargetItem]> chain-hops;
@@ -275,6 +282,7 @@ export global App {
     callback chain-edit(string);
     callback chain-delete(string);
     callback chain-save();
+    callback chain-template(int, string);
     callback chain-hop-add();
     callback chain-hop-pick(int);
     callback chain-hop-remove(int);

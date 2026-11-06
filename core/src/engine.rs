@@ -81,6 +81,7 @@ struct State {
     /// Routes whose own servers do not answer: their traffic uses the VPN for now.
     route_spare: HashSet<String>,
     last_route_check: u64,
+    standby: Option<String>,
     update: update_ops::UpdateState,
 }
 
@@ -97,6 +98,9 @@ struct Applied {
 struct Health {
     /// Confirmed failures of a manually chosen server in a row.
     manual_fails: u32,
+    standby_id: Option<String>,
+    standby_fails: u8,
+    standby_at: Option<Instant>,
 }
 
 pub struct Engine {
@@ -419,6 +423,7 @@ pub struct StatusView {
     pub error: Option<String>,
     pub message: Option<String>,
     pub server: Option<ServerView>,
+    pub standby: Option<ServerView>,
     pub auto: bool,
     pub scan: Progress,
     pub pool: usize,
@@ -475,7 +480,7 @@ fn warp_note(st: &State) -> String {
         return "Работает".into();
     }
     if st.netp.as_ref().is_some_and(|p| p.cf_blocked()) {
-        return "Cloudflare недоступен в вашей сети — напрямую WARP не заработает. Через VPN работает: цепочка «VPN → WARP»".into();
+        return "Cloudflare недоступен в этой сети — WARP напрямую может не работать. Попробуйте цепочку «VPN → WARP»".into();
     }
     if w.iter().any(|s| s.probe.is_some()) {
         return "Напрямую не работает в вашей сети. Через VPN может пройти: цепочка «VPN → WARP»".into();
@@ -502,6 +507,7 @@ impl Engine {
         let grave: store::Grave = store::load(&paths.grave());
         let warp: Option<warp::Account> = store::load(&paths.warp());
         let netp: Option<NetProfile> = store::load(&paths.netprofile());
+        let warp_retry: u64 = store::load(&paths.warp_retry());
         let e = Arc::new(Engine {
             paths,
             version: version.to_string(),
@@ -514,6 +520,7 @@ impl Engine {
                 net: NetInfo::default(),
                 netp,
                 warp_skip_logged: false,
+                standby: None,
                 conn: Conn::default(),
                 traffic: Traffic::default(),
                 last_full: 0,
@@ -521,7 +528,7 @@ impl Engine {
                 last_subs: util::now(),
                 log: VecDeque::new(),
                 notice: (0, String::new()),
-                warp_retry: 0,
+                warp_retry,
                 route_spare: HashSet::new(),
                 last_route_check: 0,
                 update: update_ops::UpdateState::default(),
@@ -760,6 +767,7 @@ impl Engine {
                 }
             }
         }
+        scan::diversify(&mut p);
         p
     }
 
@@ -1014,6 +1022,7 @@ impl Engine {
                 if enable {
                     // switched on by hand: test it now, whatever the pause says
                     self.st.lock().unwrap().warp_retry = 0;
+                    let _ = store::save(&self.paths.warp_retry(), &0u64);
                     let me = self.clone();
                     tokio::spawn(async move { me.warp_check().await });
                 } else if self.connected() {
@@ -1026,6 +1035,7 @@ impl Engine {
                     return Err("идёт поиск серверов — WARP проверится в нём".into());
                 }
                 self.st.lock().unwrap().warp_retry = 0;
+                let _ = store::save(&self.paths.warp_retry(), &0u64);
                 let me = self.clone();
                 tokio::spawn(async move { me.warp_check().await });
                 Ok(Value::Null)
@@ -1093,6 +1103,7 @@ impl Engine {
             error: st.conn.error.clone(),
             message: st.conn.message.clone(),
             server,
+            standby: if st.conn.state == ConnState::On { st.standby.as_ref().and_then(|id| pool.iter().find(|s| &s.id == id && Some(id) != st.conn.current.as_ref())).map(|s| view(s, true)) } else { None },
             auto: st.settings.selected.is_none(),
             scan: self.progress.lock().unwrap().clone(),
             pool: pool.iter().filter(|s| s.good()).count(),
@@ -1220,6 +1231,25 @@ impl Engine {
         Ok(())
     }
 
+    fn http_policy(&self, pool: &[Server], extra: &[Server], chains: &[mihomo::ChainPlan]) -> Option<mihomo::HttpPolicy> {
+        let st = self.st.lock().unwrap();
+        if !st.settings.https_only_free { return None; }
+        let pool_free = pool.iter().any(|s| s.origin == Origin::Free);
+        let mut free_ids: Vec<String> = pool.iter().chain(extra).filter(|s| s.origin == Origin::Free).map(|s| s.id.clone()).collect();
+        for c in chains {
+            for level in &c.levels {
+                for v in level {
+                    if let Some(id) = v["name"].as_str().and_then(|s| s.split('~').next()) {
+                        if st.servers.iter().any(|s| s.id == id && s.origin == Origin::Free) { free_ids.push(id.to_string()); }
+                    }
+                }
+            }
+        }
+        let mut trusted_ids: Vec<String> = pool.iter().chain(extra).filter(|s| s.origin != Origin::Free && s.good() && s.relay.is_none()).map(|s| s.id.clone()).collect();
+        free_ids.sort(); free_ids.dedup(); trusted_ids.sort(); trusted_ids.dedup();
+        Some(mihomo::HttpPolicy { pool_free, free_ids, trusted_ids })
+    }
+
     async fn start_main(self: &Arc<Self>) -> Result<(), String> {
         let pool = self.pool();
         if pool.is_empty() {
@@ -1228,6 +1258,7 @@ impl Engine {
         let (plans, extra, chains, default_chain) = self.route_plans(&pool);
         self.write_run_files(&pool, &extra)?;
         let hops = self.relay_hop_servers(&[&pool, &extra]);
+        let http_policy = self.http_policy(&pool, &extra, &chains);
         let (opts, selected) = {
             let st = self.st.lock().unwrap();
             let s = &st.settings;
@@ -1237,6 +1268,7 @@ impl Engine {
                     secret: util::random_token(24),
                     default_direct: s.routes.default == Target::Direct,
                     default_chain,
+                    http_policy,
                     routes: plans,
                     chains,
                     hops,
@@ -1332,6 +1364,7 @@ impl Engine {
         {
             let mut st = self.st.lock().unwrap();
             st.conn = Conn::default();
+            st.standby = None;
             st.settings.was_connected = false;
             st.traffic.up = 0;
             st.traffic.down = 0;
@@ -1354,9 +1387,10 @@ impl Engine {
         let pool = self.pool();
         let (plans, extra, chains, default_chain) = self.route_plans(&pool);
         let hop_ids: Vec<String> = self.relay_hop_servers(&[&pool, &extra]).into_iter().map(|h| h.id).collect();
+        let http_policy = self.http_policy(&pool, &extra, &chains);
         let (same_plan, old_pool, old_extra) = {
             let a = self.applied.lock().unwrap();
-            let same = a.opts.as_ref().map(|o| o.routes == plans && o.chains == chains && o.default_chain == default_chain && o.hops.iter().map(|h| &h.id).eq(hop_ids.iter())).unwrap_or(true);
+            let same = a.opts.as_ref().map(|o| o.routes == plans && o.chains == chains && o.default_chain == default_chain && o.http_policy == http_policy && o.hops.iter().map(|h| &h.id).eq(hop_ids.iter())).unwrap_or(true);
             (same, a.pool.clone(), a.extra.clone())
         };
         if !same_plan && self.connected() {
@@ -1415,7 +1449,7 @@ impl Engine {
         let restart = {
             let mut st = self.st.lock().unwrap();
             let s = &mut st.settings;
-            let before = (s.stack.clone(), s.strict_route, s.ipv6);
+            let before = (s.stack.clone(), s.strict_route, s.ipv6, s.https_only_free);
             if let Some(v) = patch.get("connect_on_start").and_then(|v| v.as_bool()) {
                 s.connect_on_start = v;
             }
@@ -1436,6 +1470,7 @@ impl Engine {
             if let Some(v) = patch.get("pool_size").and_then(|v| v.as_u64()) {
                 s.pool_size = (v as usize).clamp(2, 30);
             }
+            if let Some(v) = patch.get("https_only_free").and_then(|v| v.as_bool()) { s.https_only_free = v; }
             if let Some(v) = patch.get("relay_scan").and_then(|v| v.as_bool()) {
                 s.relay_scan = v;
             }
@@ -1447,7 +1482,7 @@ impl Engine {
                     s.sort = v.to_string();
                 }
             }
-            before != (s.stack.clone(), s.strict_route, s.ipv6)
+            before != (s.stack.clone(), s.strict_route, s.ipv6, s.https_only_free)
         };
         self.save_settings();
         if restart && self.connected() {
@@ -1685,7 +1720,9 @@ impl Engine {
                     return None;
                 }
                 let changed = cached.as_ref() != Some(&p);
-                self.st.lock().unwrap().netp = Some(p.clone());
+                let network_changed = cached.as_ref().is_some_and(|old| !old.key.starts_with('|') && !p.key.starts_with('|') && old.key != p.key);
+                { let mut st = self.st.lock().unwrap(); st.netp = Some(p.clone()); if network_changed { st.warp_retry = 0; st.warp_skip_logged = false; } }
+                if network_changed { let _ = store::save(&self.paths.warp_retry(), &0u64); }
                 if changed {
                     let _ = store::save(&self.paths.netprofile(), &Some(p.clone()));
                     self.log(&format!("сеть: {}", nettest::summary(&p)));
@@ -1701,7 +1738,7 @@ impl Engine {
         let mut w: Vec<Server> = self.st.lock().unwrap().servers.iter().filter(|s| s.origin == Origin::Warp && !busy.contains(&s.id)).cloned().collect();
         if w.is_empty() { return None; }
         w.sort_by_key(scan::score);
-        if !forced && w.iter().any(|s| s.good()) { self.st.lock().unwrap().warp_retry = 0; return Some(true); }
+        if !forced && w.iter().any(|s| s.good()) { self.st.lock().unwrap().warp_retry = 0; let _ = store::save(&self.paths.warp_retry(), &0u64); return Some(true); }
         let now = util::now();
         if !forced && self.st.lock().unwrap().warp_retry > now { return None; }
         env.progress.lock().unwrap().stage = "Проверка WARP".into();
@@ -1709,17 +1746,24 @@ impl Engine {
         if env.cancel.load(Ordering::Relaxed) || res.is_empty() { return None; }
         let any = res.iter().any(|s| s.good());
         let first = { let mut st = self.st.lock().unwrap(); let first = st.warp_retry == 0; st.warp_retry = if any { 0 } else { now + WARP_PAUSE }; first };
+        let _ = store::save(&self.paths.warp_retry(), &if any { 0 } else { now + WARP_PAUSE });
         if !any && first { self.notice("WARP недоступен: ни один вариант не прошёл проверку. Следующая попытка через 3 дня; для повторной проверки включите WARP в настройках."); }
         Some(any)
     }
 
     async fn warp_check(self: Arc<Self>) {
-        if self.scanning.swap(true, Ordering::SeqCst) { return; }
+        // If the switch is turned on during a search, wait rather than silently
+        // losing the explicit request. Turning it off cancels the queued request.
+        while self.scanning.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            if !self.st.lock().unwrap().settings.warp { return; }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        if !self.st.lock().unwrap().settings.warp { self.scanning.store(false, Ordering::SeqCst); return; }
         self.reset_progress("Проверка сети");
         let env = self.scan_env();
         let profile = self.net_profile(&env, nettest::MAX_AGE).await;
         if profile.as_ref().is_some_and(NetProfile::cf_blocked) {
-            self.notice("Cloudflare недоступен напрямую. WARP можно использовать в цепочке «VPN → WARP».");
+            self.notice("Cloudflare недоступен напрямую. Попробуйте цепочку «VPN → WARP».");
             if self.connected() { let _ = self.ensure_warp().await; }
         } else {
             let mut net = self.st.lock().unwrap().net.clone();
@@ -2076,6 +2120,31 @@ impl Engine {
         }
     }
 
+    /// Test an alternative without switching the active outbound. Never start a second
+    /// WireGuard-family session: profiles can share keys with the active connection.
+    async fn check_standby(self: &Arc<Self>, api: &mihomo::Api, h: &mut Health) {
+        if h.standby_at.is_some_and(|t| t.elapsed() < Duration::from_secs(30)) { return; }
+        h.standby_at = Some(Instant::now());
+        let current = self.st.lock().unwrap().conn.current.clone();
+        if current.is_none() { self.st.lock().unwrap().standby = None; return; }
+        let candidate = self.pool().into_iter().find(|s| s.good() && Some(&s.id) != current.as_ref() && !is_wg(s) && s.origin != Origin::Warp);
+        let Some(s) = candidate else { self.st.lock().unwrap().standby = None; h.standby_id = None; h.standby_fails = 0; return; };
+        if h.standby_id.as_deref() != Some(&s.id) { h.standby_id = Some(s.id.clone()); h.standby_fails = 0; }
+        let ok = api.proxy_delay(&s.id, mihomo::TEST_URL, 4000).await.is_some();
+        if self.st.lock().unwrap().conn.current != current { self.st.lock().unwrap().standby = None; return; }
+        if ok { h.standby_fails = 0; self.st.lock().unwrap().standby = Some(s.id); }
+        else {
+            self.st.lock().unwrap().standby = None;
+            h.standby_fails += 1;
+            if h.standby_fails >= 2 {
+                h.standby_fails = 0;
+                self.mark_failed(&s.id);
+                self.save_servers();
+                self.apply_pool().await;
+            }
+        }
+    }
+
     /// Watchdog: checks the route through the tunnel and, when it fails, switches to a
     /// working server within seconds (mihomo's own fallback reacts in minutes).
     async fn health(self: &Arc<Self>, h: &mut Health) {
@@ -2092,6 +2161,7 @@ impl Engine {
         }
         let auto = self.st.lock().unwrap().settings.selected.is_none();
         if ok {
+            self.check_standby(&api, h).await;
             h.manual_fails = 0;
             let now = if auto { api.now("AUTO").await } else { None };
             let restored = {
@@ -2114,6 +2184,7 @@ impl Engine {
         if self.st.lock().unwrap().conn.state != ConnState::On {
             return;
         }
+        self.st.lock().unwrap().standby = None;
         let cur = self.st.lock().unwrap().conn.current.clone();
         // re-test every pool member inside mihomo: the AUTO fallback then takes the first alive
         let alive = api.group_delay("AUTO", mihomo::TEST_URL, 4000).await;

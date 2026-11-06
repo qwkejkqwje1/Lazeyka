@@ -27,6 +27,9 @@ impl Paths {
     pub fn warp(&self) -> PathBuf {
         self.data.join("warp.json")
     }
+    pub fn warp_retry(&self) -> PathBuf {
+        self.data.join("warp-retry.json")
+    }
     pub fn grave(&self) -> PathBuf {
         self.data.join("graveyard.json")
     }
@@ -135,6 +138,9 @@ pub struct Settings {
     /// Test servers that do not answer directly through a working entry hop.
     #[serde(default = "t")]
     pub relay_scan: bool,
+    /// Send TCP port 80 via a trusted server or directly, never via public-list servers.
+    #[serde(default = "t")]
+    pub https_only_free: bool,
     /// Check for new versions of the program and mihomo; mihomo is installed by itself.
     #[serde(default = "t")]
     pub auto_update: bool,

@@ -103,7 +103,20 @@ impl Engine {
         let mut levels: Vec<Vec<Value>> = Vec::new();
         for (i, h) in chain.hops.iter().enumerate() {
             match h {
-                Hop::Auto => levels.push(vec![]),
+                Hop::Auto if i == 0 => levels.push(vec![]),
+                Hop::Auto => {
+                    // A later VPN hop must dial through the previous hop. Referring to
+                    // the ordinary VPN group here would bypass all previous levels.
+                    let cc = Self::countries(st);
+                    let candidates = scan::pool(&st.servers, &scan::PoolOpts { size: st.settings.pool_size, countries: &cc, warp: false, selected: st.settings.selected.as_deref() });
+                    let candidates: Vec<Server> = candidates.into_iter().filter(|s| s.origin != Origin::Warp && !is_wg(s) && s.relay.is_none() && used.insert(s.id.clone())).collect();
+                    if candidates.is_empty() { return None; }
+                    levels.push(candidates.iter().map(|s| {
+                        let mut p = s.mihomo_proxy();
+                        p["name"] = Value::from(format!("{}~{}-{}", s.id, chain.id, i + 1));
+                        p
+                    }).collect());
+                }
                 _ => {
                     let cands: Vec<Server> = Self::hop_servers(st, h).into_iter().filter(|s| used.insert(s.id.clone())).collect();
                     if cands.is_empty() {
@@ -228,6 +241,18 @@ impl Engine {
                 default_chain = Some(cid.clone());
             }
         }
+        // A virtual route shares the same fallback group machinery as normal routes,
+        // but has no rule providers: MATCH points to it instead.
+        if matches!(&st.settings.routes.default, Target::Country(_) | Target::Server(_) | Target::Warp) {
+            let list = Self::route_servers(&st, &st.settings.routes.default);
+            if !list.is_empty() {
+                let ids = list.iter().map(|s| s.id.clone()).collect();
+                for s in list {
+                    if !pool.iter().any(|x| x.id == s.id) && !extra.iter().any(|x| x.id == s.id) { extra.push(s); }
+                }
+                plans.push(RoutePlan { id: mihomo::DEFAULT_ROUTE.into(), via: Via::Servers(ids), spare: mihomo::Spare::Vpn, strategy: Default::default() });
+            }
+        }
         (plans, extra, chains, default_chain)
     }
 
@@ -235,6 +260,7 @@ impl Engine {
     pub(super) fn route_server_ids(&self) -> Vec<String> {
         let st = self.st.lock().unwrap();
         let mut ids: Vec<String> = Vec::new();
+        for s in Self::route_servers(&st, &st.settings.routes.default) { if !ids.contains(&s.id) { ids.push(s.id); } }
         for r in st.settings.routes.units() {
             for s in Self::route_servers(&st, &r.target) {
                 if !ids.contains(&s.id) {
@@ -288,6 +314,7 @@ impl Engine {
                 opts.routes = plans;
                 opts.chains = chains;
                 opts.default_chain = default_chain;
+                opts.http_policy = self.http_policy(&pool, &extra, &opts.chains);
                 opts.hops = self.relay_hop_servers(&[&pool, &extra]);
                 opts.default_direct = self.st.lock().unwrap().settings.routes.default == Target::Direct;
                 let written = self.write_run_files(&pool, &extra).and_then(|_| {
@@ -475,12 +502,19 @@ impl Engine {
         let lists: Vec<Value> = st.settings.routes.lists.iter().map(|l| Self::list_json(&st, l, connected)).collect();
         json!({
             "default": st.settings.routes.default.code(),
+            "default_label": label(&st, &st.settings.routes.default),
+            "default_warn": if match &st.settings.routes.default {
+                Target::Chain(id) => st.settings.routes.chain(id).is_none_or(|c| Self::chain_plan(&st, c).is_none()),
+                t if t.uses_servers() => Self::route_servers(&st, t).is_empty(),
+                _ => false,
+            } { "Выбранное направление недоступно — пока используется VPN" } else { "" },
             "routes": list,
             "chains": chains,
             "lists": lists,
             "issues": smart::lint(&st.settings.routes).into_iter().map(|i| i.text).collect::<Vec<_>>(),
             "countries": countries,
             "warp": warp,
+            "warp_good": st.servers.iter().any(|s| s.origin == Origin::Warp && s.good()),
             "warp_note": super::warp_note(&st),
         })
     }
@@ -499,8 +533,11 @@ impl Engine {
         tokio::spawn(async move {
             match me.ensure_warp().await {
                 Ok(()) => {
-                    let ids: Vec<String> = me.st.lock().unwrap().servers.iter().filter(|s| s.origin == Origin::Warp).map(|s| s.id.clone()).collect();
-                    me.clone().check_ids(ids).await;
+                    let paused_or_blocked = { let st = me.st.lock().unwrap(); st.warp_retry > util::now() || st.netp.as_ref().is_some_and(NetProfile::cf_blocked) };
+                    if !paused_or_blocked {
+                        let ids: Vec<String> = me.st.lock().unwrap().servers.iter().filter(|s| s.origin == Origin::Warp).map(|s| s.id.clone()).collect();
+                        me.clone().check_ids(ids).await;
+                    }
                 }
                 Err(e) => me.log(&format!("WARP: {e}")),
             }
@@ -510,14 +547,16 @@ impl Engine {
     pub(super) async fn route_default(self: &Arc<Self>, target: &str) -> Result<Value, String> {
         let t = Self::parse_target(target)?;
         match &t {
-            Target::Vpn | Target::Direct => {}
+            Target::Vpn | Target::Direct | Target::Country(_) | Target::Warp => {}
+            Target::Server(id) => { if !self.st.lock().unwrap().servers.iter().any(|s| &s.id == id) { return Err("сервер не найден".into()); } }
             Target::Chain(cid) => {
                 if self.st.lock().unwrap().settings.routes.chain(cid).is_none() {
                     return Err("цепочка не найдена".into());
                 }
             }
-            _ => return Err("остальной трафик идёт через VPN, напрямую или по цепочке".into()),
+            Target::Block => return Err("остальной трафик нельзя заблокировать этим выбором".into()),
         }
+        self.want_warp(&t);
         let before = {
             let mut st = self.st.lock().unwrap();
             let b = st.settings.routes.clone();

@@ -206,6 +206,10 @@ export component HomePage inherits Rectangle {
                 Icon { y: (parent.height - self.height) / 2; name: "chevron-right"; size: 18px; color: Theme.faint; }
             }
         }
+        if App.state == 2 && App.standby != "": Text {
+            text: "Запасной: " + App.standby; color: Theme.dim; font-size: 11.5px;
+            horizontal-alignment: center; overflow: elide;
+        }
         // routes summary
         Clickable {
             height: 52px;
@@ -217,8 +221,8 @@ export component HomePage inherits Rectangle {
                 Icon { y: (parent.height - self.height) / 2; name: App.routes-spare > 0 ? "alert" : "split"; size: 18px; color: App.routes-spare > 0 ? Theme.warn : Theme.dim; }
                 Text {
                     text: App.routes-on == 0
-                        ? (App.route-default == 0 ? "Весь трафик через VPN" : "Весь трафик напрямую — маршрутов нет")
-                        : "Маршрутов: " + App.routes-on + (App.route-default == 0 ? " · остальное через VPN" : " · остальное напрямую")
+                        ? ("Весь трафик: " + App.default-label)
+                        : "Маршрутов: " + App.routes-on + " · остальное: " + App.default-label
                             + (App.routes-spare > 0 ? " · " + App.routes-spare + " через запасной путь" : "");
                     color: Theme.text;
                     font-size: 13px;

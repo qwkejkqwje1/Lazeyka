@@ -621,6 +621,27 @@ pub fn pool(all: &[Server], o: &PoolOpts) -> Vec<Server> {
     out
 }
 
+/// Prefer different public networks and protocol families near each other, while
+/// preserving the first choice, the favourite/own-server priority and the score order.
+pub fn diversify(pool: &mut Vec<Server>) {
+    fn subnet(host: &str) -> String {
+        match host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(a)) => { let o = a.octets(); format!("{}.{}.{}", o[0], o[1], o[2]) }
+            Ok(std::net::IpAddr::V6(a)) => { let o = a.segments(); format!("{:x}:{:x}:{:x}", o[0], o[1], o[2]) }
+            Err(_) => host.to_ascii_lowercase(),
+        }
+    }
+    for i in 1..pool.len() {
+        if pool[i].origin != Origin::Free || pool[i].fav { continue; }
+        let prev_net = subnet(&pool[i-1].host);
+        let prev_proto = pool[i-1].proto;
+        let end = (i + 4).min(pool.len());
+        let best = (i..end).take_while(|j| pool[*j].origin == Origin::Free && !pool[*j].fav)
+            .max_by_key(|j| ((subnet(&pool[*j].host) != prev_net) as u8 * 2 + (pool[*j].proto != prev_proto) as u8, std::cmp::Reverse(*j)));
+        if let Some(j) = best { if j != i { let s = pool.remove(j); pool.insert(i, s); } }
+    }
+}
+
 struct Lab {
     proc: mihomo::Process,
     nodes: Vec<Listener>,
@@ -1046,6 +1067,17 @@ mod tests {
             s.probe = Some(Probe { at: 1, ok: lat > 0, latency: Some(lat), exit_cc: Some(cc.into()), services: 7, udp: Some(true), ..Default::default() });
         }
         s
+    }
+
+    #[test]
+    fn diversify_keeps_priority_and_changes_network() {
+        let mut a = srv("1.2.3.1", Origin::Free, Some((1, "NL")));
+        a.fav = true;
+        let mut p = vec![a, srv("1.2.3.2", Origin::Free, Some((2, "NL"))), srv("1.2.3.3", Origin::Free, Some((3, "NL"))), srv("2.3.4.5", Origin::Free, Some((4, "NL")))];
+        diversify(&mut p);
+        assert_eq!(p[0].host, "1.2.3.1");
+        assert_eq!(p[1].host, "2.3.4.5");
+        assert_eq!(p.len(), 4);
     }
 
     #[test]

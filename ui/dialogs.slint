@@ -729,7 +729,7 @@ export component TargetKindsDialog inherits Modal {
             checked: root.kind == "server";
             clicked => { App.target-step = 2; }
         }
-        if App.has-chains: OptionRow {
+        OptionRow {
             title: "Через цепочку…";
             subtitle: "Несколько серверов подряд, выход — через последний";
             checked: root.kind == "chain";
@@ -741,14 +741,14 @@ export component TargetKindsDialog inherits Modal {
             checked: root.kind == "warp";
             clicked => { App.pick-target("warp"); }
         }
-        OptionRow {
+        if App.target-for != "@default": OptionRow {
             title: "Блокировать";
             subtitle: "Сайты не откроются, у программ не будет сети";
             checked: root.kind == "block";
             clicked => { App.pick-target("block"); }
         }
         Text {
-            text: "Если серверы маршрута перестанут отвечать, его трафик временно пойдёт через VPN — мимо VPN он не пойдёт.";
+            text: "Если серверы маршрута перестанут отвечать, трафик временно пойдёт через VPN. Правило HTTP в настройках может направить порт 80 напрямую.";
             color: Theme.faint;
             font-size: 11.5px;
             wrap: word-wrap;
@@ -906,22 +906,16 @@ export component RouteDeleteDialog inherits Modal {
 }
 
 export component TargetChainDialog inherits Modal {
-    property <bool> edit: App.target-for != "" && App.target-for != "@default";
+    property <bool> edit: App.target-for != "";
     title: "Цепочка";
     max-h: 660px;
     close => { App.dialog = ""; }
     VerticalLayout {
         spacing: 8px;
+        OptionRow { title: "VPN → WARP"; subtitle: "Сначала VPN, затем WARP"; clicked => { App.chain-template(0, App.target-for); } }
+        if App.warp-good: OptionRow { title: "WARP → VPN"; subtitle: "Сначала WARP, затем VPN"; clicked => { App.chain-template(1, App.target-for); } }
         Rectangle {
-            height: min(max(App.target-chains.length, 1) * 52px, 380px);
-            if App.target-chains.length == 0: Text {
-                text: "Цепочек пока нет — создайте первую кнопкой «Цепочки» на странице маршрутов.";
-                color: Theme.faint;
-                font-size: 12px;
-                wrap: word-wrap;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
+            height: min(App.target-chains.length * 52px, 210px);
             if App.target-chains.length > 0: ListView {
                 for c in App.target-chains: Rectangle {
                     height: 52px;
@@ -940,6 +934,7 @@ export component TargetChainDialog inherits Modal {
             font-size: 11.5px;
             wrap: word-wrap;
         }
+        Btn { text: "Новая цепочка…"; kind: 1; clicked => { App.chain-new(); } }
         HorizontalLayout {
             alignment: start;
             Btn {

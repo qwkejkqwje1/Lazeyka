@@ -159,6 +159,7 @@ pub fn route_warp_group(id: &str) -> String {
 pub fn route_provider(id: &str, part: &str) -> String {
     format!("rt-{id}-{part}")
 }
+pub const DEFAULT_ROUTE: &str = "__default";
 pub const ROUTE_PARTS: [&str; 3] = ["apps", "sites", "ips"];
 
 fn regex_escape(s: &str) -> String {
@@ -172,6 +173,13 @@ fn regex_escape(s: &str) -> String {
     o
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct HttpPolicy {
+    pub pool_free: bool,
+    pub free_ids: Vec<String>,
+    pub trusted_ids: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct MainOpts {
     pub api_port: u16,
@@ -180,6 +188,7 @@ pub struct MainOpts {
     pub default_direct: bool,
     /// The default target is this chain (id) when it could be built.
     pub default_chain: Option<String>,
+    pub http_policy: Option<HttpPolicy>,
     pub routes: Vec<RoutePlan>,
     /// Chains referenced by the routes or the default target.
     pub chains: Vec<ChainPlan>,
@@ -233,6 +242,15 @@ pub fn main_config(o: &MainOpts) -> Value {
             "timeout": 5000
         }),
     ];
+    if let Some(policy) = &o.http_policy {
+        if !policy.trusted_ids.is_empty() {
+            let filter = format!("^(?:{})$", policy.trusted_ids.iter().map(|i| regex_escape(i)).collect::<Vec<_>>().join("|"));
+            groups.push(json!({ "name":"PLAIN-own", "type":"fallback", "use":["pool","extra"], "filter":filter, "url":TEST_URL, "interval":300, "lazy":true, "timeout":5000, "empty-fallback":"REJECT" }));
+            groups.push(json!({ "name":"PLAIN", "type":"fallback", "proxies":["PLAIN-own","DIRECT"], "url":TEST_URL, "interval":300, "lazy":true, "timeout":5000 }));
+        } else {
+            groups.push(json!({ "name":"PLAIN", "type":"select", "proxies":["DIRECT"] }));
+        }
+    }
     // Chains: every level is a fallback group of suffixed proxy copies; a copy of
     // level N dials through the group of level N-1, so traffic enters level 1 and
     // leaves through the last level. An empty level is the VPN group itself.
@@ -282,14 +300,31 @@ pub fn main_config(o: &MainOpts) -> Value {
             groups.push(json!({ "name": chain_group(&c.id), "type": "select", "proxies": [chain_level_group(&c.id, last)] }));
         }
     }
+    let chain_free = |cid: &str, p: &HttpPolicy| -> bool {
+        o.chains.iter().find(|c| c.id == cid).and_then(|c| c.levels.last()).is_some_and(|level| {
+            if level.is_empty() { p.pool_free } else { level.iter().any(|v| v["name"].as_str().and_then(|s| s.split('~').next()).is_some_and(|id| p.free_ids.iter().any(|i| i == id))) }
+        })
+    };
+    let route_free = |r: &RoutePlan, p: &HttpPolicy| -> bool {
+        match &r.via {
+            Via::Direct | Via::Block => false,
+            Via::Vpn => p.pool_free,
+            Via::Servers(ids) => ids.iter().any(|id| p.free_ids.contains(id)) || matches!(r.spare, Spare::Vpn | Spare::Warp(_)) && p.pool_free,
+            Via::Chain(id) => chain_free(id, p) || matches!(r.spare, Spare::Vpn | Spare::Warp(_)) && p.pool_free,
+        }
+    };
     for r in &o.routes {
         let out = r.outbound();
         for part in ROUTE_PARTS {
+            if r.id == DEFAULT_ROUTE { break; }
             let name = route_provider(&r.id, part);
             rule_providers.insert(
                 name.clone(),
                 json!({ "type": "file", "behavior": "classical", "format": "text", "path": format!("./routes/{}-{part}.txt", r.id) }),
             );
+            if o.http_policy.as_ref().is_some_and(|p| route_free(r, p)) {
+                rules.push(format!("AND,((RULE-SET,{name}),(NETWORK,TCP),(DST-PORT,80)),PLAIN"));
+            }
             rules.push(if part == "ips" { format!("RULE-SET,{name},{out},no-resolve") } else { format!("RULE-SET,{name},{out}") });
         }
         if let Via::Servers(ids) = &r.via {
@@ -353,8 +388,15 @@ pub fn main_config(o: &MainOpts) -> Value {
     let default_out = match &o.default_chain {
         Some(cid) => chain_group(cid),
         None if o.default_direct => "DIRECT".to_string(),
-        None => "VPN".to_string(),
+        None => o.routes.iter().find(|r| r.id == DEFAULT_ROUTE).map(RoutePlan::outbound).unwrap_or_else(|| "VPN".to_string()),
     };
+    let default_free = o.http_policy.as_ref().is_some_and(|p| {
+        if o.default_direct { false }
+        else if let Some(cid) = &o.default_chain { chain_free(cid, p) }
+        else if let Some(r) = o.routes.iter().find(|r| r.id == DEFAULT_ROUTE) { route_free(r, p) }
+        else { p.pool_free }
+    });
+    if default_free { rules.push("AND,((NETWORK,TCP),(DST-PORT,80)),PLAIN".into()); }
     rules.push(format!("MATCH,{default_out}"));
     // Real lookups (UDP to domains, rule matching) go through the tunnel: the network may
     // block or tamper with DNS. Only proxy server names are resolved directly.
@@ -917,6 +959,7 @@ mod tests {
             secret: "s".into(),
             default_direct: false,
             default_chain: None,
+            http_policy: None,
             routes: vec![],
             chains: vec![],
             hops: vec![],
@@ -997,6 +1040,32 @@ mod tests {
         // the default target is the chain
         let rules = v["rules"].as_array().unwrap();
         assert_eq!(rules.last().unwrap(), "MATCH,CH-c1");
+    }
+
+    #[test]
+    fn plain_http_bypasses_public_servers_only() {
+        let mut o = opts();
+        o.http_policy = Some(HttpPolicy { pool_free: true, free_ids: vec!["free".into()], trusted_ids: vec!["own".into()] });
+        o.routes.push(RoutePlan { id:"r1".into(), via:Via::Servers(vec!["free".into()]), spare:Spare::Vpn, strategy:Default::default() });
+        let v = main_config(&o);
+        let rules = v["rules"].as_array().unwrap();
+        assert!(rules.iter().any(|r| r == "AND,((RULE-SET,rt-r1-sites),(NETWORK,TCP),(DST-PORT,80)),PLAIN"));
+        assert!(rules.iter().any(|r| r == "AND,((NETWORK,TCP),(DST-PORT,80)),PLAIN"));
+        assert!(v["proxy-groups"].as_array().unwrap().iter().any(|g| g["name"] == "PLAIN-own"));
+        o.http_policy = Some(HttpPolicy { pool_free:false, free_ids:vec![], trusted_ids:vec!["own".into()] });
+        o.routes.clear();
+        let v = main_config(&o);
+        assert!(!v["rules"].as_array().unwrap().iter().any(|r| r.as_str().unwrap_or("").contains("DST-PORT,80")));
+    }
+
+    #[test]
+    fn default_server_group_does_not_create_rule_providers() {
+        let mut o = opts();
+        o.routes.push(RoutePlan { id: DEFAULT_ROUTE.into(), via: Via::Servers(vec!["node".into()]), spare: Spare::Vpn, strategy: Default::default() });
+        let v = main_config(&o);
+        assert_eq!(v["rules"].as_array().unwrap().last().unwrap(), "MATCH,R-__default");
+        assert!(v["proxy-groups"].as_array().unwrap().iter().any(|g| g["name"] == "R-__default"));
+        assert!(v["rule-providers"].as_object().unwrap().is_empty());
     }
 
     #[test]
