@@ -418,7 +418,7 @@ pub fn lines(p: &NetProfile) -> Vec<(String, String, i8, String)> {
         },
         tri(p.cloudflare),
         if p.cloudflare == Some(false) {
-            "WARP напрямую не заработает — Лазейка его не проверяет и не тратит на это время. Серверы с адресами Cloudflare пропускаются. Попробуйте WARP через VPN: цепочка «VPN → WARP».".into()
+            "Cloudflare не ответил на проверку, поэтому прямую проверку WARP Лазейка временно пропускает. Серверы с адресами Cloudflare пропускаются. Попробуйте WARP через VPN: цепочка «VPN → WARP».".into()
         } else {
             String::new()
         },
@@ -431,7 +431,7 @@ pub fn lines(p: &NetProfile) -> Vec<(String, String, i8, String)> {
             None => "не проверен".into(),
         },
         tri(p.udp),
-        if p.udp == Some(false) { "Hysteria2, TUIC и WireGuard из бесплатных списков не проверяются: в этой сети они не заработают.".into() } else { String::new() },
+        if p.udp == Some(false) { "Прямой поиск временно пропускает Hysteria2, TUIC и WireGuard из бесплатных списков: проверенные UDP-направления не ответили. Другие адреса и порты могут работать.".into() } else { String::new() },
     ));
     out.push((
         "DNS".into(),

@@ -99,6 +99,21 @@ impl Engine {
     /// earlier hop cannot serve again — a chain through itself is a loop); the
     /// caller then falls back to the VPN, never to a direct connection.
     fn chain_plan(st: &State, chain: &Chain) -> Option<mihomo::ChainPlan> {
+        // A manually selected WARP is already using this device key; a chain copy
+        // must not open a second concurrent session for the same account.
+        if chain.hops.contains(&Hop::Warp) {
+            let units = st.settings.routes.units();
+            let direct_warp = st.settings.routes.default == Target::Warp || units.iter().any(|r| r.target == Target::Warp || (r.target.uses_servers() && r.fallback == Fallback::Warp));
+            if direct_warp || st.settings.selected.as_ref().is_some_and(|id| st.servers.iter().any(|s| &s.id == id && s.origin == Origin::Warp)) { return None; }
+            // Different WARP chains would create different sessions with one key.
+            // Prefer the default chain, then the first active route's chain.
+            let warp_chain = |t: &Target| match t {
+                Target::Chain(id) if st.settings.routes.chain(id).is_some_and(|c| c.hops.contains(&Hop::Warp)) => Some(id.clone()),
+                _ => None,
+            };
+            let first = warp_chain(&st.settings.routes.default).or_else(|| units.iter().find_map(|r| warp_chain(&r.target)));
+            if first.as_ref().is_some_and(|id| id != &chain.id) { return None; }
+        }
         let mut used: HashSet<String> = HashSet::new();
         let mut levels: Vec<Vec<Value>> = Vec::new();
         for (i, h) in chain.hops.iter().enumerate() {
@@ -507,14 +522,14 @@ impl Engine {
                 Target::Chain(id) => st.settings.routes.chain(id).is_none_or(|c| Self::chain_plan(&st, c).is_none()),
                 t if t.uses_servers() => Self::route_servers(&st, t).is_empty(),
                 _ => false,
-            } { "Выбранное направление недоступно — пока используется VPN" } else { "" },
+            } || (connected && st.route_spare.contains(mihomo::DEFAULT_ROUTE)) { "Выбранное направление недоступно — пока используется VPN" } else { "" },
             "routes": list,
             "chains": chains,
             "lists": lists,
             "issues": smart::lint(&st.settings.routes).into_iter().map(|i| i.text).collect::<Vec<_>>(),
             "countries": countries,
             "warp": warp,
-            "warp_good": st.servers.iter().any(|s| s.origin == Origin::Warp && s.good()),
+            "warp_good": !st.netp.as_ref().is_some_and(NetProfile::cf_blocked) && st.servers.iter().any(|s| s.origin == Origin::Warp && s.good()),
             "warp_note": super::warp_note(&st),
         })
     }
@@ -1208,5 +1223,63 @@ impl Engine {
         if !names.is_empty() {
             self.log(&format!("маршрут на запасном пути (через VPN): {}", names.join(", ")));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server(host: &str, origin: Origin) -> Server {
+        let p = serde_json::json!({"type":"trojan","server":host,"port":443,"password":"x"});
+        let mut s = Server::new(host, p.as_object().unwrap().clone(), origin, "test").unwrap();
+        s.probe = Some(Probe { ok:true, latency:Some(20), ..Default::default() });
+        s
+    }
+
+    #[test]
+    fn warp_chain_reuses_neither_pool_key_nor_later_vpn_as_direct() {
+        let path = std::env::temp_dir().join(format!("lazeyka-chain-test-{}", util::random_token(10)));
+        let e = Engine::new(Paths { data:path.clone(), bin:path.clone() }, "test");
+        let free = server("198.51.100.2", Origin::Free);
+        let warp = server("198.51.100.3", Origin::Warp);
+        let chain = Chain::new("WARP → VPN", vec![Hop::Warp, Hop::Auto]);
+        {
+            let mut st = e.st.lock().unwrap();
+            st.servers = vec![free.clone(), warp.clone()];
+            st.settings.routes.chains.push(chain.clone());
+            st.settings.routes.default = Target::Chain(chain.id.clone());
+        }
+        assert!(!e.pool().iter().any(|s| s.origin == Origin::Warp));
+        {
+            let mut st = e.st.lock().unwrap();
+            let plan = Engine::chain_plan(&st, &chain).unwrap();
+            assert!(plan.levels[0][0]["name"].as_str().unwrap().starts_with(&warp.id));
+            assert!(plan.levels[1][0]["name"].as_str().unwrap().starts_with(&free.id));
+            st.settings.selected = Some(warp.id.clone());
+            assert!(Engine::chain_plan(&st, &chain).is_none());
+            st.settings.selected = None;
+            let mut r = Route::new("direct warp", Target::Warp);
+            r.sites.push("example.com".into());
+            st.settings.routes.list.push(r);
+            assert!(Engine::chain_plan(&st, &chain).is_none());
+        }
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn default_server_gets_virtual_plan_and_provider_entry() {
+        let path = std::env::temp_dir().join(format!("lazeyka-default-test-{}", util::random_token(10)));
+        let e = Engine::new(Paths { data:path.clone(), bin:path.clone() }, "test");
+        let s = server("198.51.100.9", Origin::Free);
+        {
+            let mut st = e.st.lock().unwrap();
+            st.servers.push(s.clone());
+            st.settings.routes.default = Target::Server(s.id.clone());
+        }
+        let (plans, extra, _, _) = e.route_plans(&[]);
+        assert!(plans.iter().any(|p| p.id == mihomo::DEFAULT_ROUTE && p.via == Via::Servers(vec![s.id.clone()])));
+        assert!(extra.iter().any(|x| x.id == s.id));
+        let _ = std::fs::remove_dir_all(path);
     }
 }

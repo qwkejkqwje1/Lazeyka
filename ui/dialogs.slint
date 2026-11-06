@@ -913,7 +913,7 @@ export component TargetChainDialog inherits Modal {
     VerticalLayout {
         spacing: 8px;
         OptionRow { title: "VPN → WARP"; subtitle: "Сначала VPN, затем WARP"; clicked => { App.chain-template(0, App.target-for); } }
-        if App.warp-good: OptionRow { title: "WARP → VPN"; subtitle: "Сначала WARP, затем VPN"; clicked => { App.chain-template(1, App.target-for); } }
+        if App.warp-good: OptionRow { title: "WARP → VPN"; subtitle: "Сначала WARP, затем подходящий сервер VPN (не WireGuard)"; clicked => { App.chain-template(1, App.target-for); } }
         Rectangle {
             height: min(App.target-chains.length * 52px, 210px);
             if App.target-chains.length > 0: ListView {

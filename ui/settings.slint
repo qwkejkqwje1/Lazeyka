@@ -57,8 +57,8 @@ export component SettingsPage inherits Rectangle {
                         }
                         Divider { }
                         SettingRow {
-                            title: "HTTP не через бесплатные серверы";
-                            subtitle: "TCP-порт 80: через свой сервер или WARP; иначе напрямую, с раскрытием IP. Другие порты не проверяются.";
+                            title: "Защита HTTP на порту 80";
+                            subtitle: "Свой сервер / WARP или напрямую с раскрытием IP.";
                             checked: App.https-only-free;
                             toggled(v) => { App.set-flag("https_only_free", v); }
                         }

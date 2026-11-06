@@ -757,6 +757,15 @@ impl Engine {
             &scan::PoolOpts { size: st.settings.pool_size, countries: &cc, warp: st.settings.warp, selected: st.settings.selected.as_deref() },
         );
         p.retain(|s| scan::relay_ok(&st.servers, s));
+        // WARP chains use a config-level copy of the shared WARP key. Do not also
+        // health-check a pool copy of that key, which would steal the session.
+        let uses_warp_chain = |t: &Target| match t {
+            Target::Chain(id) => st.settings.routes.chain(id).is_some_and(|c| c.hops.contains(&crate::routes::Hop::Warp)),
+            _ => false,
+        };
+        let chain_active = uses_warp_chain(&st.settings.routes.default) || st.settings.routes.units().iter().any(|r| uses_warp_chain(&r.target));
+        let manual_warp = st.settings.selected.as_ref().is_some_and(|id| st.servers.iter().any(|s| &s.id == id && s.origin == Origin::Warp));
+        if chain_active && !manual_warp { p.retain(|s| s.origin != Origin::Warp); }
         let class = |s: &Server| if s.fav { 0 } else if s.origin == Origin::Mine { 1 } else { 2 };
         let auto_on = st.settings.selected.is_none() && st.conn.state == ConnState::On;
         if let (true, Some(cur)) = (auto_on, st.conn.current.as_deref()) {
@@ -1827,6 +1836,7 @@ impl Engine {
                 st.servers
                     .iter()
                     .filter(|s| s.origin == Origin::Free && !s.fav && s.good() && !busy.contains(&s.id))
+                    .filter(|s| !(skip_udp && scan::is_udp_proto(s)) && !(cf_blocked && s.host.parse().ok().is_some_and(nettest::in_cloudflare)))
                     .filter(|s| s.probe.as_ref().is_some_and(|p| now.saturating_sub(p.at) > if is_wg(s) { 24 * 3600 } else { 15 * 60 }))
                     .cloned()
                     .collect()
