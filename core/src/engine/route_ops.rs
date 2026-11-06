@@ -1312,21 +1312,26 @@ impl Engine {
                 }
             }
         }
-        let mut st = self.st.lock().unwrap();
-        if due {
-            st.last_route_check = now;
-        }
-        let newly: Vec<String> = spare.difference(&st.route_spare).cloned().collect();
-        st.route_spare = spare;
-        let names: Vec<String> = newly
-            .iter()
-            .filter_map(|id| {
-                st.settings.routes.get(id).map(|r| r.name.clone()).or_else(|| {
-                    id.strip_prefix('l').and_then(|lid| st.settings.routes.entry_list(lid)).map(|l| l.name.clone())
+        // The guard must die at the end of this block, not just via drop():
+        // an explicit drop() in the same scope still keeps the guard's slot
+        // in the async state machine, which makes the whole future !Send
+        // (tokio::spawn in Engine::start then refuses to compile).
+        let names: Vec<String> = {
+            let mut st = self.st.lock().unwrap();
+            if due {
+                st.last_route_check = now;
+            }
+            let newly: Vec<String> = spare.difference(&st.route_spare).cloned().collect();
+            st.route_spare = spare;
+            newly
+                .iter()
+                .filter_map(|id| {
+                    st.settings.routes.get(id).map(|r| r.name.clone()).or_else(|| {
+                        id.strip_prefix('l').and_then(|lid| st.settings.routes.entry_list(lid)).map(|l| l.name.clone())
+                    })
                 })
-            })
-            .collect();
-        drop(st);
+                .collect()
+        };
         if !names.is_empty() {
             self.log(&format!("маршрут на запасном пути (через VPN): {}", names.join(", ")));
         }

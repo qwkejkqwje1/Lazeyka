@@ -594,7 +594,9 @@ pub fn transport_label(proto: Proto, p: &Map<String, Value>) -> String {
         Proto::Wireguard => {}
         Proto::Openvpn => parts.push(s("proto").to_ascii_uppercase()),
         Proto::Masque => {
-            if net == "h2" {
+            // `net` is already normalised above ("h2" became "H2"); comparing
+            // against the raw "h2" here mislabelled every MASQUE server as H3.
+            if net == "H2" {
                 parts.push("HTTP/2".into());
             } else {
                 parts.push("QUIC·H3".into());
