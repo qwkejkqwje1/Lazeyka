@@ -74,6 +74,13 @@ export component SettingsPage inherits Rectangle {
                 SectionTitle { text: "СЕТЬ"; x: 4px; }
                 Card {
                     VerticalLayout {
+                        LinkRow {
+                            title: "Проверка сети";
+                            subtitle: App.net-summary != "" ? App.net-summary : "Что блокирует ваша сеть";
+                            icon: "radar";
+                            clicked => { App.open-dialog("net-test"); }
+                        }
+                        Divider { }
                         SettingRow {
                             title: "Защита от утечек";
                             subtitle: "Строгая маршрутизация: трафик не уйдёт мимо VPN";

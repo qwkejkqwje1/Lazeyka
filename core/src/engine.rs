@@ -6,6 +6,7 @@ use crate::geo::Geo;
 use crate::mihomo::{RoutePlan, Via};
 use crate::model::*;
 use crate::routes::{Routes, Target};
+use crate::nettest::{self, NetProfile};
 use crate::scan::{self, NetInfo, Progress};
 use crate::store::{self, Paths, Settings, Subscription};
 use crate::{import, mihomo, netif, sources, util, warp};
@@ -62,6 +63,10 @@ struct State {
     grave: store::Grave,
     warp: Option<warp::Account>,
     net: NetInfo,
+    /// What the network blocks, for the network it was measured on (see `nettest`).
+    netp: Option<NetProfile>,
+    /// "WARP is not tested here" was written to the log (once per run).
+    warp_skip_logged: bool,
     conn: Conn,
     traffic: Traffic,
     last_full: u64,
@@ -109,6 +114,8 @@ pub struct Engine {
     generation: AtomicU64,
     last_scan_try: AtomicU64,
     measuring: tokio::sync::Mutex<()>,
+    /// One network test at a time (the scanner and the settings button may meet).
+    net_testing: tokio::sync::Mutex<()>,
     applied: Mutex<Applied>,
 }
 
@@ -334,6 +341,13 @@ pub enum Req {
     Warp {
         enable: bool,
     },
+    /// Tests WARP now (the button in the settings), whatever the pause says.
+    WarpCheck,
+    /// «Что блокирует ваша сеть»: the last result; `force` runs the test now (≈20 s).
+    NetTest {
+        #[serde(default)]
+        force: bool,
+    },
     Logs,
 }
 
@@ -439,8 +453,10 @@ pub struct StatusView {
     pub update_mihomo: String,
 }
 
-/// How long WARP is left alone after none of its variants worked.
-const WARP_PAUSE: u64 = 6 * 3600;
+/// How long WARP is left alone after none of its variants worked: where it is blocked it
+/// stays blocked, and every attempt costs a registration and a dozen handshakes. The
+/// settings button and switching WARP on test it at once.
+const WARP_PAUSE: u64 = 3 * 86400;
 
 fn is_wg(s: &Server) -> bool {
     matches!(s.proto, Proto::Wireguard | Proto::Awg)
@@ -458,10 +474,20 @@ fn warp_note(st: &State) -> String {
     if w.iter().any(|s| s.good()) {
         return "Работает".into();
     }
+    if st.netp.as_ref().is_some_and(|p| p.cf_blocked()) {
+        return "Cloudflare недоступен в вашей сети — напрямую WARP не заработает. Через VPN работает: цепочка «VPN → WARP»".into();
+    }
     if w.iter().any(|s| s.probe.is_some()) {
         return "Напрямую не работает в вашей сети. Через VPN может пройти: цепочка «VPN → WARP»".into();
     }
     "Проверяется…".into()
+}
+
+fn net_view(p: Option<&NetProfile>) -> Value {
+    match p {
+        Some(p) => json!({ "summary": nettest::summary(p), "at": p.at, "lines": nettest::lines(p).into_iter().map(|(title, value, state, note)| json!({"title":title,"value":value,"state":state,"note":note})).collect::<Vec<_>>() }),
+        None => json!({ "summary": "Проверка ещё не выполнена", "at": 0, "lines": [] }),
+    }
 }
 
 impl Engine {
@@ -475,6 +501,7 @@ impl Engine {
         let stats: store::Stats = store::load(&paths.stats());
         let grave: store::Grave = store::load(&paths.grave());
         let warp: Option<warp::Account> = store::load(&paths.warp());
+        let netp: Option<NetProfile> = store::load(&paths.netprofile());
         let e = Arc::new(Engine {
             paths,
             version: version.to_string(),
@@ -485,6 +512,8 @@ impl Engine {
                 grave,
                 warp,
                 net: NetInfo::default(),
+                netp,
+                warp_skip_logged: false,
                 conn: Conn::default(),
                 traffic: Traffic::default(),
                 last_full: 0,
@@ -507,6 +536,7 @@ impl Engine {
             generation: AtomicU64::new(0),
             last_scan_try: AtomicU64::new(0),
             measuring: tokio::sync::Mutex::new(()),
+            net_testing: tokio::sync::Mutex::new(()),
             applied: Mutex::new(Applied::default()),
         });
         e.log(&format!("Лазейка {version} запущена"));
@@ -891,6 +921,7 @@ impl Engine {
                 let mut v = serde_json::to_value(&st.settings).unwrap_or(Value::Null);
                 if let Some(m) = v.as_object_mut() {
                     m.insert("warp_note".into(), Value::from(warp_note(&st)));
+                    m.insert("net_summary".into(), Value::from(st.netp.as_ref().map(nettest::summary).unwrap_or_default()));
                 }
                 Ok(v)
             }
@@ -981,16 +1012,31 @@ impl Engine {
                 }
                 self.save_settings();
                 if enable {
+                    // switched on by hand: test it now, whatever the pause says
+                    self.st.lock().unwrap().warp_retry = 0;
                     let me = self.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = me.ensure_warp().await {
-                            me.log(&e);
-                        }
-                    });
+                    tokio::spawn(async move { me.warp_check().await });
                 } else if self.connected() {
                     self.apply_pool().await;
                 }
                 Ok(Value::Null)
+            }
+            Req::WarpCheck => {
+                if self.scanning.load(Ordering::Relaxed) {
+                    return Err("идёт поиск серверов — WARP проверится в нём".into());
+                }
+                self.st.lock().unwrap().warp_retry = 0;
+                let me = self.clone();
+                tokio::spawn(async move { me.warp_check().await });
+                Ok(Value::Null)
+            }
+            Req::NetTest { force } => {
+                if force {
+                    let env = self.scan_env();
+                    if self.net_profile(&env, 0).await.is_none() { return Err("Не удалось проверить сеть. Проверьте подключение и повторите попытку.".into()); }
+                }
+                let st = self.st.lock().unwrap();
+                Ok(net_view(st.netp.as_ref()))
             }
             Req::Logs => {
                 let st = self.st.lock().unwrap();
@@ -1627,12 +1673,79 @@ impl Engine {
         Ok(())
     }
 
+    /// Identify the current network before reusing a cached result.
+    async fn net_profile(&self, env: &scan::Env, max_age: u64) -> Option<NetProfile> {
+        let _guard = self.net_testing.lock().await;
+        let cached = self.st.lock().unwrap().netp.clone();
+        match scan::net_test(env, cached.as_ref(), max_age).await {
+            Ok((net, p)) => {
+                if net.direct_ip.is_some() { self.st.lock().unwrap().net = net; }
+                if !p.valid() {
+                    self.log("проверка сети: ни один сайт не ответил — проверьте подключение");
+                    return None;
+                }
+                let changed = cached.as_ref() != Some(&p);
+                self.st.lock().unwrap().netp = Some(p.clone());
+                if changed {
+                    let _ = store::save(&self.paths.netprofile(), &Some(p.clone()));
+                    self.log(&format!("сеть: {}", nettest::summary(&p)));
+                }
+                Some(p)
+            }
+            Err(e) => { self.log(&format!("проверка сети: {e}")); None }
+        }
+    }
+
+    async fn warp_stage(self: &Arc<Self>, env: &scan::Env, base: &scan::Opts, net: &mut NetInfo, busy: &HashSet<String>, forced: bool) -> Option<bool> {
+        if let Err(e) = self.ensure_warp().await { self.log(&format!("WARP: {e}")); return None; }
+        let mut w: Vec<Server> = self.st.lock().unwrap().servers.iter().filter(|s| s.origin == Origin::Warp && !busy.contains(&s.id)).cloned().collect();
+        if w.is_empty() { return None; }
+        w.sort_by_key(scan::score);
+        if !forced && w.iter().any(|s| s.good()) { self.st.lock().unwrap().warp_retry = 0; return Some(true); }
+        let now = util::now();
+        if !forced && self.st.lock().unwrap().warp_retry > now { return None; }
+        env.progress.lock().unwrap().stage = "Проверка WARP".into();
+        let res = scan::check(env, w, base, net, |b| self.merge(b)).await;
+        if env.cancel.load(Ordering::Relaxed) || res.is_empty() { return None; }
+        let any = res.iter().any(|s| s.good());
+        let first = { let mut st = self.st.lock().unwrap(); let first = st.warp_retry == 0; st.warp_retry = if any { 0 } else { now + WARP_PAUSE }; first };
+        if !any && first { self.notice("WARP недоступен: ни один вариант не прошёл проверку. Следующая попытка через 3 дня; для повторной проверки включите WARP в настройках."); }
+        Some(any)
+    }
+
+    async fn warp_check(self: Arc<Self>) {
+        if self.scanning.swap(true, Ordering::SeqCst) { return; }
+        self.reset_progress("Проверка сети");
+        let env = self.scan_env();
+        let profile = self.net_profile(&env, nettest::MAX_AGE).await;
+        if profile.as_ref().is_some_and(NetProfile::cf_blocked) {
+            self.notice("Cloudflare недоступен напрямую. WARP можно использовать в цепочке «VPN → WARP».");
+            if self.connected() { let _ = self.ensure_warp().await; }
+        } else {
+            let mut net = self.st.lock().unwrap().net.clone();
+            let busy = self.busy_ids();
+            if self.warp_stage(&env, &scan::Opts::default(), &mut net, &busy, true).await == Some(true) { self.notice("WARP работает"); }
+            self.st.lock().unwrap().net = net;
+        }
+        self.save_servers();
+        if self.connected() { self.apply_pool().await; }
+        self.finish_progress();
+        self.scanning.store(false, Ordering::SeqCst);
+    }
+
     pub async fn scan_task(self: Arc<Self>, full: bool, interactive: bool) {
         if self.scanning.swap(true, Ordering::SeqCst) {
             return;
         }
-        self.reset_progress("Загрузка списков");
+        self.reset_progress("Проверка сети");
         let env = self.scan_env();
+        let prof = self.net_profile(&env, if interactive { 1800 } else { nettest::MAX_AGE }).await;
+        let skip_udp = prof.as_ref().is_some_and(NetProfile::skip_udp);
+        let cf_blocked = prof.as_ref().is_some_and(NetProfile::cf_blocked);
+        let whitelist = prof.as_ref().is_some_and(|p| p.whitelist);
+        let volume = prof.as_ref().map_or(true, NetProfile::volume);
+        if skip_udp { self.log("сеть: UDP за рубеж не проходит — пропускаем UDP-серверы из бесплатных списков"); }
+        if cf_blocked { self.log("сеть: Cloudflare недоступен — пропускаем его адреса при прямом поиске"); }
         let busy = self.busy_ids();
         let (settings, mut net) = {
             let st = self.st.lock().unwrap();
@@ -1641,7 +1754,7 @@ impl Engine {
         let target = settings.scan_target;
         let want: HashSet<String> = settings.countries.iter().cloned().collect();
         // a plain TCP connect only means something when probes go out directly
-        let base = scan::Opts { target_good: 0, speed_top: 0, want_cc: want.clone(), prefilter: !self.connected(), ..Default::default() };
+        let base = scan::Opts { target_good: 0, speed_top: 0, want_cc: want.clone(), prefilter: !self.connected(), volume, ..Default::default() };
         let route_cc = self.missing_route_countries();
         // 1. user's own and starred servers
         let mine: Vec<Server> = {
@@ -1651,40 +1764,14 @@ impl Engine {
         if !mine.is_empty() {
             self.check_split(&env, mine, &base, &mut net, true).await;
         }
-        // 2. WARP
+        // 2. WARP (variants share one key and must never be probed while active).
         if settings.warp && !env.cancel.load(Ordering::Relaxed) {
-            match self.ensure_warp().await {
-                Ok(()) => {
-                    let w: Vec<Server> = {
-                        let st = self.st.lock().unwrap();
-                        let mut v: Vec<Server> = st.servers.iter().filter(|s| s.origin == Origin::Warp && !busy.contains(&s.id)).cloned().collect();
-                        // previously working variants first
-                        v.sort_by_key(|s| scan::score(s));
-                        v
-                    };
-                    // all variants share one device key: while one of them works,
-                    // testing the rest only fights its session — re-test when none works
-                    if !w.is_empty() && !w.iter().any(|s| s.good()) {
-                        let now = util::now();
-                        let paused = self.st.lock().unwrap().warp_retry > now;
-                        // nothing ever worked: not on every search, only every 6 hours (a search
-                        // started by the user always tests)
-                        if !paused || interactive {
-                            let res = scan::check(&env, w, &base, &mut net, |b| self.merge(b)).await;
-                            if !env.cancel.load(Ordering::Relaxed) && !res.is_empty() {
-                                let any = res.iter().any(|s| s.good());
-                                let first = self.st.lock().unwrap().warp_retry == 0;
-                                self.st.lock().unwrap().warp_retry = if any { 0 } else { now + WARP_PAUSE };
-                                if !any && first {
-                                    self.notice("WARP недоступен в вашей сети: ни один вариант не прошёл проверку. Повторю через 6 часов (кнопка поиска проверит сразу).");
-                                }
-                            }
-                        }
-                    } else {
-                        self.st.lock().unwrap().warp_retry = 0;
-                    }
-                }
-                Err(e) => self.log(&e),
+            if cf_blocked {
+                let log = { let mut st = self.st.lock().unwrap(); let b = !st.warp_skip_logged; st.warp_skip_logged = true; b };
+                if log { self.log("WARP: Cloudflare недоступен напрямую; цепочка «VPN → WARP» использует VPN"); }
+                if self.connected() { let _ = self.ensure_warp().await; }
+            } else {
+                self.warp_stage(&env, &base, &mut net, &busy, false).await;
             }
         }
         // 3. known working public servers whose last check is old: after an outage the
@@ -1710,7 +1797,9 @@ impl Engine {
         let seen_file = self.paths.cache().join("seen.json");
         let mut seen: HashMap<String, u64> = store::load(&seen_file);
         let fc = sources::fetch_client();
-        for tier in 1..=3u8 {
+        if whitelist { self.log("сеть похожа на белые списки — проверяем соответствующие источники первыми"); }
+        for tier in 0..=3u8 {
+            if tier == 0 && !whitelist { continue; }
             if env.cancel.load(Ordering::Relaxed) {
                 break;
             }
@@ -1720,7 +1809,7 @@ impl Engine {
                 break;
             }
             env.progress.lock().unwrap().stage = "Загрузка списков".into();
-            let defs: Vec<sources::SourceDef> = srcs.iter().filter(|d| d.tier == tier && d.enabled).cloned().collect();
+            let defs: Vec<sources::SourceDef> = srcs.iter().filter(|d| d.enabled && if whitelist { if tier == 0 { d.id.contains("white") } else { d.tier == tier && !d.id.contains("white") } } else { d.tier == tier }).cloned().collect();
             let mut js = tokio::task::JoinSet::new();
             for d in defs.clone() {
                 let c = fc.clone();
@@ -1778,6 +1867,7 @@ impl Engine {
                 let st = self.st.lock().unwrap();
                 let mut cands: Vec<Server> = st.servers.iter().filter(|s| tier_ids.contains(&s.source) && !busy.contains(&s.id)).cloned().collect();
                 cands.append(&mut fresh);
+                cands.retain(|s| !(skip_udp && s.origin == Origin::Free && scan::is_udp_proto(s)) && !(cf_blocked && s.origin == Origin::Free && s.host.parse().ok().is_some_and(nettest::in_cloudflare)));
                 let hints = scan::Hints::learn(&st.servers, util::now());
                 scan::plan(&cands, &srcs, &st.stats, if full { 1500 } else { 700 }, util::now(), &prefer, &hints)
             };

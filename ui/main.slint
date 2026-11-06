@@ -5,7 +5,7 @@ import { HomePage } from "home.slint";
 import { ServersPage } from "servers.slint";
 import { RoutesPage } from "routes.slint";
 import { SettingsPage } from "settings.slint";
-import { AddDialog, ServerDialog, AppsDialog, SourcesDialog, SubsDialog, LogDialog, AboutDialog, UninstallDialog, SortDialog, CountriesDialog, LocationDialog, TargetKindsDialog, TargetCountryDialog, TargetServerDialog, TargetChainDialog, ChainsDialog, ChainEditDialog, HopKindsDialog, HopCountryDialog, HopServerDialog, ListsDialog, ListEditDialog, ListNameDialog, ListDeleteDialog, RouteNameDialog, RouteDeleteDialog, PresetsDialog } from "dialogs.slint";
+import { NetTestDialog, AddDialog, ServerDialog, AppsDialog, SourcesDialog, SubsDialog, LogDialog, AboutDialog, UninstallDialog, SortDialog, CountriesDialog, LocationDialog, TargetKindsDialog, TargetCountryDialog, TargetServerDialog, TargetChainDialog, ChainsDialog, ChainEditDialog, HopKindsDialog, HopCountryDialog, HopServerDialog, ListsDialog, ListEditDialog, ListNameDialog, ListDeleteDialog, RouteNameDialog, RouteDeleteDialog, PresetsDialog } from "dialogs.slint";
 
 export { App, ServerItem, SourceItem, SubItem, CountryItem, RouteItem, TargetItem }
 
@@ -155,6 +155,7 @@ export component AppWindow inherits Window {
     if App.dialog == "sources": SourcesDialog { }
     if App.dialog == "subs": SubsDialog { }
     if App.dialog == "log": LogDialog { }
+    if App.dialog == "net-test": NetTestDialog { }
     if App.dialog == "about": AboutDialog { }
     if App.dialog == "uninstall": UninstallDialog { }
     if App.dialog == "sort": SortDialog { }

@@ -33,6 +33,10 @@ impl Paths {
     pub fn stats(&self) -> PathBuf {
         self.data.join("sources.json")
     }
+    /// What the network blocks (`nettest`), for the network it was measured on.
+    pub fn netprofile(&self) -> PathBuf {
+        self.data.join("netprofile.json")
+    }
     pub fn cache(&self) -> PathBuf {
         self.data.join("cache")
     }

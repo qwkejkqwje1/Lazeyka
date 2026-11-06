@@ -1,3 +1,10 @@
+export struct NetLine {
+    title: string,
+    value: string,
+    state: int,
+    note: string,
+}
+
 export struct ServerItem {
     id: string,
     name: string,
@@ -182,6 +189,9 @@ export global App {
     in-out property <string> quick-value;
     // WARP in one line: works / blocked here / off
     in property <string> warp-note;
+    in property <string> net-summary;
+    in property <[NetLine]> net-lines;
+    in property <bool> net-busy;
     in property <int> routes-on;
     in property <int> routes-spare;
     // route editor (shown instead of the list while route-open)
@@ -306,6 +316,7 @@ export global App {
     callback refresh-subs();
     callback remove-sub(string);
     callback open-dialog(string);
+    callback net-test();
     callback copy-log();
     callback uninstall();
     callback page-changed(int);

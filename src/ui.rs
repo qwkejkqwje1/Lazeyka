@@ -897,6 +897,7 @@ impl Ctl {
         let b = |k: &str, d: bool| v.get(k).and_then(Value::as_bool).unwrap_or(d);
         let (cos, warp, strict, ipv6) = (b("connect_on_start", false), b("warp", true), b("strict_route", true), b("ipv6", true));
         let (auto_update, relay_scan) = (b("auto_update", true), b("relay_scan", true));
+        let net_summary = v.get("net_summary").and_then(Value::as_str).unwrap_or("").to_string();
         let warp_note = v.get("warp_note").and_then(Value::as_str).unwrap_or("").to_string();
         let stack = v.get("stack").and_then(Value::as_str).and_then(|s| STACKS.iter().position(|x| *x == s)).unwrap_or(0) as i32;
         let sort = v.get("sort").and_then(Value::as_str).and_then(|s| SORTS.iter().position(|x| *x == s)).unwrap_or(0) as i32;
@@ -919,6 +920,7 @@ impl Ctl {
             a.set_connect_on_start(cos);
             a.set_warp(warp);
             a.set_warp_note(ss(warp_note));
+            a.set_net_summary(ss(net_summary));
             a.set_strict_route(strict);
             a.set_ipv6(ipv6);
             a.set_auto_update(auto_update);
@@ -2114,6 +2116,27 @@ impl Ctl {
         });
     }
 
+    async fn load_net_test(self: &Arc<Self>, force: bool) {
+        self.ui(move |w| w.global::<App>().set_net_busy(force));
+        let result = self.client.call_timeout(json!({"cmd":"net_test", "force":force}), Duration::from_secs(90)).await;
+        match result {
+            Ok(v) => {
+                let summary = v.get("summary").and_then(Value::as_str).unwrap_or("").to_string();
+                let lines: Vec<(String,String,i32,String)> = v.get("lines").and_then(Value::as_array).map(|a| a.iter().map(|v| (
+                    v["title"].as_str().unwrap_or("").to_string(), v["value"].as_str().unwrap_or("").to_string(), v["state"].as_i64().unwrap_or(0) as i32, v["note"].as_str().unwrap_or("").to_string()
+                )).collect()).unwrap_or_default();
+                self.ui(move |w| {
+                    let a = w.global::<App>();
+                    a.set_net_summary(ss(summary));
+                    let rows = lines.into_iter().map(|(title,value,state,note)| NetLine { title:ss(title), value:ss(value), state, note:ss(note) }).collect::<Vec<_>>();
+                    a.set_net_lines(ModelRc::from(Rc::new(VecModel::from(rows))));
+                    a.set_net_busy(false);
+                });
+            }
+            Err(e) => { self.ui(|w| w.global::<App>().set_net_busy(false)); self.toast(format!("Проверка сети: {e}")); }
+        }
+    }
+
     fn open_dialog(self: &Arc<Self>, name: String) {
         let me = self.clone();
         if name == "target" {
@@ -2134,6 +2157,7 @@ impl Ctl {
                 "sources" | "subs" => me.load_sources().await,
                 "presets" => me.load_presets().await,
                 "log" => me.load_logs().await,
+                "net-test" => me.load_net_test(false).await,
                 "target" => {
                     me.push_targets();
                     me.load_routes().await;
@@ -2932,6 +2956,8 @@ fn wire(w: &AppWindow, ctl: &Arc<Ctl>) {
     });
     let c = ctl.clone();
     a.on_open_dialog(move |n| c.open_dialog(n.to_string()));
+    let c = ctl.clone();
+    a.on_net_test(move || { let me = c.clone(); c.go(async move { me.load_net_test(true).await; }); });
     let c = ctl.clone();
     a.on_copy_log(move || {
         let mut text = String::new();

@@ -520,6 +520,37 @@ export component SubsDialog inherits Modal {
     }
 }
 
+export component NetTestDialog inherits Modal {
+    title: "Проверка сети";
+    max-h: 650px;
+    close => { App.dialog = ""; }
+    Text { text: App.net-summary != "" ? App.net-summary : "Узнайте, что блокирует ваша сеть."; color: Theme.dim; font-size: 12px; wrap: word-wrap; }
+    Rectangle {
+        height: 365px;
+        background: Theme.bg;
+        border-radius: 10px;
+        ListView {
+            for row in App.net-lines: Rectangle {
+                height: row-layout.preferred-height;
+                row-layout := VerticalLayout {
+                    padding: 10px;
+                    spacing: 4px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text { text: row.title; color: Theme.text; font-size: 12.5px; font-weight: 600; horizontal-stretch: 1; }
+                        Text { text: row.value; color: row.state > 0 ? Theme.accent : row.state < 0 ? Theme.warn : Theme.dim; font-size: 12px; }
+                    }
+                    if row.note != "": Text { text: row.note; color: Theme.dim; font-size: 11px; wrap: word-wrap; }
+                }
+            }
+        }
+    }
+    HorizontalLayout {
+        Rectangle { horizontal-stretch: 1; }
+        Btn { text: App.net-busy ? "Проверяем…" : "Проверить снова"; kind: 1; busy: App.net-busy; clicked => { App.net-test(); } }
+    }
+}
+
 export component LogDialog inherits Modal {
     title: "Журнал";
     max-h: 640px;
@@ -768,6 +799,10 @@ export component TargetCountryDialog inherits Modal {
                 kind: 2;
                 min-height: 32px;
                 clicked => { App.target-step = 0; }
+            }
+            if App.target-countries.length == 0: Btn {
+                text: "Найти серверы"; kind: 1;
+                clicked => { App.dialog = ""; App.scan(); }
             }
         }
     }

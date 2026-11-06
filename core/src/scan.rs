@@ -5,6 +5,7 @@
 use crate::geo::Geo;
 use crate::mihomo::{self, Listener};
 use crate::model::*;
+use crate::nettest::{self, NetProfile};
 use crate::probe;
 use crate::sources::SourceDef;
 use crate::util;
@@ -627,6 +628,11 @@ struct Lab {
 }
 
 async fn start_lab(env: &Env, servers: &[&Server]) -> Result<Lab, String> {
+    start_lab_in(env, &env.dir, servers).await
+}
+
+/// A lab in its own directory: two labs at once must not share one config file.
+async fn start_lab_in(env: &Env, dir: &std::path::Path, servers: &[&Server]) -> Result<Lab, String> {
     let ports = mihomo::free_ports(servers.len() + 2);
     if ports.len() < servers.len() + 2 {
         return Err("нет свободных портов".into());
@@ -643,11 +649,11 @@ async fn start_lab(env: &Env, servers: &[&Server]) -> Result<Lab, String> {
     all.push(direct.clone());
     let secret = util::random_token(24);
     let cfg = mihomo::lab_config(servers, &mihomo::LabOpts { api_port: ports[0], secret: secret.clone(), interface: env.interface.clone(), listeners: all });
-    std::fs::create_dir_all(&env.dir).map_err(|e| e.to_string())?;
-    mihomo::write_atomic(&env.dir.join("lab.json"), cfg.to_string().as_bytes()).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    mihomo::write_atomic(&dir.join("lab.json"), cfg.to_string().as_bytes()).map_err(|e| e.to_string())?;
     let proc = mihomo::Process::start(mihomo::Spawn {
         bin: &env.mihomo,
-        dir: &env.dir,
+        dir,
         config_file: "lab.json",
         api_port: ports[0],
         secret: &secret,
@@ -674,6 +680,21 @@ pub async fn netinfo(l: &Listener, geo: Option<&Geo>) -> NetInfo {
         n.user_cc = t.ip.and_then(|ip| geo.and_then(|g| g.country(ip))).or(t.loc);
     }
     n
+}
+
+/// The network test ([`nettest::run`]) through a lab without servers. A fresh `cached`
+/// result for the same network is returned as is (the network itself is still identified:
+/// that is what tells "the same network" from another one).
+pub async fn net_test(env: &Env, cached: Option<&NetProfile>, max_age: u64) -> Result<(NetInfo, NetProfile), String> {
+    let mut lab = start_lab_in(env, &env.dir.join("net"), &[]).await?;
+    let net = netinfo(&lab.direct, env.geo.as_deref()).await;
+    let key = nettest::key_of(net.direct_ip, net.user_cc.as_deref());
+    let p = match cached.filter(|c| net.direct_ip.is_some() && c.fresh(&key, util::now(), max_age)) {
+        Some(c) => c.clone(),
+        None => nettest::run(&lab.direct, key).await,
+    };
+    lab.proc.stop().await;
+    Ok((net, p))
 }
 
 /// E2E test hook (debug builds only): a local test server exits with the machine's own

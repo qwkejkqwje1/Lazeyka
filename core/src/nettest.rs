@@ -239,6 +239,31 @@ async fn dns_https(c: &reqwest::Client, name: &str) -> Option<Vec<Ipv4Addr>> {
     dns_answers(&b, 0)
 }
 
+/// A QUIC packet of a version nobody speaks (0x1a2a3a4a, reserved for exactly this):
+/// a QUIC server answers with Version Negotiation. Shows whether UDP to port 443 (QUIC,
+/// Hysteria2, TUIC) gets out, which DNS and STUN on their own ports do not prove.
+pub fn quic_probe() -> Vec<u8> {
+    let mut p = Vec::with_capacity(1200);
+    p.extend_from_slice(&[0xC0, 0x1a, 0x2a, 0x3a, 0x4a]);
+    let ids: [u8; 16] = rand::random();
+    p.push(8);
+    p.extend_from_slice(&ids[..8]);
+    p.push(8);
+    p.extend_from_slice(&ids[8..]);
+    // servers ignore Initial-sized probes below 1200 bytes
+    p.resize(1200, 0);
+    p
+}
+
+pub fn is_version_negotiation(b: &[u8]) -> bool {
+    b.len() >= 7 && b[0] & 0x80 != 0 && b[1..5] == [0, 0, 0, 0]
+}
+
+async fn quic_udp(l: &Listener, host: &str) -> bool {
+    let pkt = quic_probe();
+    probe::udp_exchange(l.port, &l.user, &l.pass, host, 443, &pkt, Duration::from_secs(5), is_version_negotiation).await.is_ok()
+}
+
 fn bogon(ip: &Ipv4Addr) -> bool {
     ip.is_private() || ip.is_loopback() || ip.is_unspecified() || ip.is_link_local() || ip.is_broadcast() || ip.octets()[0] == 0
 }
@@ -275,9 +300,10 @@ pub async fn run(l: &Listener, key: String) -> NetProfile {
     let udp = async {
         let stun_g = probe::stun_via(l.port, &l.user, &l.pass, "stun.l.google.com", 19302, Duration::from_secs(6));
         let dns_g = dns_udp(l, "8.8.8.8", "www.google.com");
+        let quic_g = quic_udp(l, "www.google.com");
         let dns_y = dns_udp(l, "77.88.8.8", "ya.ru");
-        let (a, b, y) = tokio::join!(stun_g, dns_g, dns_y);
-        (a.is_ok() || b.is_some(), y.is_some())
+        let (a, b, q, y) = tokio::join!(stun_g, dns_g, quic_g, dns_y);
+        (a.is_ok() || b.is_some() || q, y.is_some())
     };
     let spoof = async {
         let mut pairs = Vec::new();
@@ -318,7 +344,7 @@ pub async fn run(l: &Listener, key: String) -> NetProfile {
         p.udp = if udp_foreign { Some(true) } else if udp_home { Some(false) } else { None };
         p.dns_spoof = spoofed;
         // stalled after a few kilobytes while the domestic control (if it answered) went through
-        let control_ok = home != Dl::Cut(0) && !matches!(home, Dl::Cut(n) if n < 64 * 1024);
+        let control_ok = matches!(home, Dl::Full | Dl::Cut(65536..));
         let mut cut_hosts: Vec<String> = dl.iter().filter(|(_, r)| matches!(r, Dl::Cut(n) if *n < 64 * 1024)).map(|(n, _)| n.clone()).collect();
         cut_hosts.sort();
         let full = dl.iter().any(|(_, r)| *r == Dl::Full);
@@ -490,5 +516,14 @@ mod tests {
         let dead = NetProfile::default();
         assert!(!dead.skip_udp() && !dead.cf_blocked() && dead.volume());
         assert_eq!(key_of(Some("95.24.1.2".parse().unwrap()), Some("RU")), "95.24.0.0/16|RU");
+    }
+
+    #[test]
+    fn quic_negotiation() {
+        let p = quic_probe();
+        assert_eq!(p.len(), 1200);
+        assert_eq!(&p[..5], &[0xC0, 0x1a, 0x2a, 0x3a, 0x4a]);
+        assert!(is_version_negotiation(&[0x80 | 0x31, 0, 0, 0, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8, 8, 0, 0, 0, 1]));
+        assert!(!is_version_negotiation(&[0xC0, 0, 0, 0, 1, 8]), "a normal long header packet");
     }
 }

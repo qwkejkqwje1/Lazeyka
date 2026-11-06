@@ -282,7 +282,10 @@ pub async fn volume_cut(c: &reqwest::Client) -> Option<u64> {
         let url = u.replace("{n}", &VOLUME_BYTES.to_string());
         match download(c, &url, VOLUME_BYTES).await {
             Dl::Full => return None,
-            Dl::Cut(n) => return Some(n),
+            // the cut hits at ~16 KB of the outer connection; more than that inside
+            // means a slow server, not a cut
+            Dl::Cut(n) if n < 64 * 1024 => return Some(n),
+            Dl::Cut(_) => return None,
             Dl::Fail => continue,
         }
     }

@@ -406,7 +406,7 @@ pub fn main_config(o: &MainOpts) -> Value {
             "default-nameserver": ["77.88.8.8", "1.1.1.1", "8.8.8.8"],
             "nameserver": doh_vpn,
             // proxy hostnames: DoH, plus plain DNS in case DoH is blocked
-            "proxy-server-nameserver": ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", "77.88.8.8"],
+            "proxy-server-nameserver": ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", "https://common.dot.dns.yandex.net/dns-query", "77.88.8.8"],
             // excluded (direct) domains: the network's own resolver gives the nearest CDN
             "direct-nameserver": ["system://", "77.88.8.8"],
         },
@@ -490,7 +490,9 @@ pub fn lab_config(servers: &[&Server], o: &LabOpts) -> Value {
             })
         })
         .collect();
-    let doh = json!(["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]);
+    // Cloudflare's and Google's resolvers are blocked or slowed in some networks; Yandex's
+    // answers from inside the country (all are asked at once, the first answer wins)
+    let doh = json!(["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", "https://common.dot.dns.yandex.net/dns-query"]);
     let mut cfg = json!({
         "mode": "rule",
         "log-level": "error",
@@ -508,9 +510,10 @@ pub fn lab_config(servers: &[&Server], o: &LabOpts) -> Value {
             "enable": true,
             "ipv6": false,
             "enhanced-mode": "redir-host",
-            "default-nameserver": ["1.1.1.1", "8.8.8.8"],
+            "default-nameserver": ["77.88.8.8", "1.1.1.1", "8.8.8.8"],
             "nameserver": doh,
-            "proxy-server-nameserver": doh,
+            // server names: plain DNS as well, in case every DoH is blocked
+            "proxy-server-nameserver": ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", "https://common.dot.dns.yandex.net/dns-query", "77.88.8.8"],
         },
         "proxies": proxies,
         "proxy-groups": [{ "name": "ALL", "type": "select", "proxies": if names.is_empty() { vec![Value::from("DIRECT")] } else { names } }],
