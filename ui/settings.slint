@@ -44,23 +44,30 @@ export component SettingsPage inherits Rectangle {
                     VerticalLayout {
                         SettingRow {
                             title: "Cloudflare WARP";
-                            subtitle: App.warp && App.warp-note != "" ? "Запасной бесплатный сервер · " + App.warp-note : "Запасной бесплатный сервер (AmneziaWG)";
+                            subtitle: App.warp && App.warp-note != "" ? "Бесплатный узел Cloudflare · " + App.warp-note : "Бесплатный узел Cloudflare (AmneziaWG / MASQUE)";
                             checked: App.warp;
                             toggled(v) => { App.set-flag("warp", v); }
                         }
                         Divider { }
                         SettingRow {
                             title: "Поиск через входное звено";
-                            subtitle: "Серверы, закрытые напрямую, проверять через рабочий сервер";
+                            subtitle: "Серверы, блокируемые ТСПУ напрямую, проверять через рабочий узел (2-hop)";
                             checked: App.relay-scan;
                             toggled(v) => { App.set-flag("relay_scan", v); }
                         }
                         Divider { }
                         SettingRow {
                             title: "Защита HTTP на порту 80";
-                            subtitle: "Свой сервер / WARP или напрямую с раскрытием IP.";
+                            subtitle: "Не передавать нешифрованный HTTP через чужие публичные серверы (только свой сервер / WARP или блокировка)";
                             checked: App.https-only-free;
                             toggled(v) => { App.set-flag("https_only_free", v); }
+                        }
+                        if App.https-only-free: Divider { }
+                        if App.https-only-free: SettingRow {
+                            title: "Разрешить прямой выход HTTP (порт 80)";
+                            subtitle: "Если нет своего сервера и WARP, пускать порт 80 напрямую мимо VPN (раскрывает ваш IP на старых HTTP-сайтах)";
+                            checked: App.http-allow-direct;
+                            toggled(v) => { App.set-flag("http_allow_direct", v); }
                         }
                         Divider { }
                         LinkRow {
@@ -83,14 +90,14 @@ export component SettingsPage inherits Rectangle {
                     VerticalLayout {
                         LinkRow {
                             title: "Проверка сети";
-                            subtitle: App.net-summary != "" ? App.net-summary : "Что блокирует ваша сеть";
+                            subtitle: App.net-summary != "" ? App.net-summary : "Что блокирует ваша сеть (TCP/UDP/Cloudflare/DNS/16 КБ)";
                             icon: "radar";
                             clicked => { App.open-dialog("net-test"); }
                         }
                         Divider { }
                         SettingRow {
                             title: "Защита от утечек";
-                            subtitle: "Строгая маршрутизация, кроме выбранных исключений и правила HTTP";
+                            subtitle: "Строгая маршрутизация (strict-route) и защита от утечек DNS/WebRTC";
                             checked: App.strict-route;
                             toggled(v) => { App.set-flag("strict_route", v); }
                         }
@@ -112,7 +119,7 @@ export component SettingsPage inherits Rectangle {
                                 changed(i) => { App.set-stack(i); }
                             }
                             Text {
-                                text: "gVisor работает везде и не требует правил брандмауэра. System быстрее, но может спросить разрешение брандмауэра.";
+                                text: "gVisor — максимальная совместимость без запросов брандмауэра. Mixed — системный TCP + gVisor для UDP (баланс скорости и надёжности). System — максимальная скорость TCP, может запросить разрешение брандмауэра Windows.";
                                 color: Theme.dim;
                                 font-size: 11.5px;
                                 wrap: word-wrap;
@@ -125,7 +132,7 @@ export component SettingsPage inherits Rectangle {
                     VerticalLayout {
                         SettingRow {
                             title: "Проверять обновления";
-                            subtitle: "Раз в 12 часов; mihomo обновляется сам";
+                            subtitle: "Раз в 12 часов с обязательной проверкой SHA-256 и заголовка PE";
                             checked: App.auto-update;
                             toggled(v) => { App.set-flag("auto_update", v); }
                         }

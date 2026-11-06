@@ -39,23 +39,85 @@ fn hop_label(st: &State, h: &Hop) -> String {
     }
 }
 
+/// Human-readable full hop path for the route analyzer: `Компьютер → ... → Интернет`.
+fn explain_path(st: &State, t: &Target) -> String {
+    match t {
+        Target::Direct => "Компьютер → Прямое соединение (мимо VPN) → Интернет".into(),
+        Target::Block => "Компьютер → Блокировка (REJECT)".into(),
+        Target::Vpn => {
+            if let Some(cur) = st.conn.current.as_ref().and_then(|id| st.servers.iter().find(|s| &s.id == id)) {
+                let v = view_with(cur, true, &st.servers);
+                if !v.relay_name.is_empty() {
+                    return format!("Компьютер → {} (входное звено) → {} ({}) → Интернет", v.relay_name, v.name, v.cc);
+                }
+                return format!("Компьютер → {} ({}) → Интернет", v.name, if v.cc.is_empty() { "VPN" } else { &v.cc });
+            }
+            "Компьютер → Основной пул VPN (AUTO) → Интернет".into()
+        }
+        Target::Warp => "Компьютер → Cloudflare WARP → Интернет".into(),
+        Target::Country(cc) => {
+            let cname = countries::name(cc).unwrap_or(cc);
+            let srvs = Engine::route_servers(st, t);
+            if let Some(best) = srvs.first() {
+                let v = view_with(best, false, &st.servers);
+                if !v.relay_name.is_empty() {
+                    return format!("Компьютер → {} (входное звено) → {} ({cname}) → Интернет", v.relay_name, v.name);
+                }
+                return format!("Компьютер → {} ({cname}) → Интернет", v.name);
+            }
+            format!("Компьютер → Страна: {cname} (резерв: VPN) → Интернет")
+        }
+        Target::Server(id) => match st.servers.iter().find(|s| &s.id == id) {
+            Some(s) => {
+                let v = view_with(s, false, &st.servers);
+                if !v.relay_name.is_empty() {
+                    format!("Компьютер → {} (входное звено) → {} → Интернет", v.relay_name, v.name)
+                } else {
+                    format!("Компьютер → {} → Интернет", v.name)
+                }
+            }
+            None => "Компьютер → Основной пул VPN (сервер удалён) → Интернет".into(),
+        },
+        Target::Chain(id) => match st.settings.routes.chain(id) {
+            Some(c) => {
+                let hops: Vec<String> = c.hops.iter().map(|h| hop_label(st, h)).collect();
+                format!("Компьютер → {} → Интернет", hops.join(" → "))
+            }
+            None => "Компьютер → Основной пул VPN (цепочка удалена) → Интернет".into(),
+        },
+    }
+}
+
 impl Engine {
     /// Servers a route target goes through, best first; empty = the VPN instead.
+    /// Excludes disabled, auth-blocked, or circuit-broken servers so dead nodes (like
+    /// `95.213.245.84:443` in `R-__default-s`) are immediately evicted.
     fn route_servers(st: &State, t: &Target) -> Vec<Server> {
+        let now = util::now();
+        let usable = |s: &Server| !s.disabled && !s.auth_error && !s.circuit_open(now);
         let class = |s: &Server| if s.fav { 0 } else if s.origin == Origin::Mine { 1 } else { 2 };
         match t {
-            Target::Server(id) => st.servers.iter().filter(|s| &s.id == id).cloned().collect(),
+            Target::Server(id) => st
+                .servers
+                .iter()
+                .filter(|s| &s.id == id && usable(s) && s.probe.as_ref().is_none_or(|p| p.ok))
+                .cloned()
+                .collect(),
             Target::Country(cc) => {
-                let mut v: Vec<&Server> = st.servers.iter().filter(|s| s.good() && s.country() == Some(cc.as_str()) && scan::relay_ok(&st.servers, s)).collect();
+                let mut v: Vec<&Server> = st
+                    .servers
+                    .iter()
+                    .filter(|s| usable(s) && s.good() && s.country() == Some(cc.as_str()) && scan::relay_ok(&st.servers, s))
+                    .collect();
                 v.sort_by_key(|s| (class(s), scan::score(s)));
                 let mut hosts = HashSet::new();
                 v.into_iter().filter(|s| hosts.insert(s.host.clone())).take(COUNTRY_SERVERS).cloned().collect()
             }
             Target::Warp => {
-                let mut v: Vec<&Server> = st.servers.iter().filter(|s| s.origin == Origin::Warp && s.good()).collect();
+                let mut v: Vec<&Server> = st.servers.iter().filter(|s| s.origin == Origin::Warp && usable(s) && s.good()).collect();
                 if v.is_empty() {
                     // not checked yet: the route group finds out itself, the VPN is the spare
-                    v = st.servers.iter().filter(|s| s.origin == Origin::Warp && s.probe.is_none()).collect();
+                    v = st.servers.iter().filter(|s| s.origin == Origin::Warp && usable(s) && s.probe.is_none()).collect();
                 }
                 v.sort_by_key(|s| scan::score(s));
                 v.into_iter().take(WARP_SERVERS).cloned().collect()
@@ -78,6 +140,7 @@ impl Engine {
 
     /// Servers of one chain hop, best first (the VPN hop has none of its own).
     fn hop_servers(st: &State, h: &Hop) -> Vec<Server> {
+        let now = util::now();
         match h {
             Hop::Auto => vec![],
             Hop::Country(cc) => Self::route_servers(st, &Target::Country(cc.clone())),
@@ -87,7 +150,7 @@ impl Engine {
             // an earlier hop WARP often works where it is blocked directly, so a variant
             // that failed from here still qualifies (best record first).
             Hop::Warp => {
-                let mut v: Vec<&Server> = st.servers.iter().filter(|s| s.origin == Origin::Warp).collect();
+                let mut v: Vec<&Server> = st.servers.iter().filter(|s| s.origin == Origin::Warp && !s.disabled && !s.auth_error && !s.circuit_open(now)).collect();
                 v.sort_by_key(|s| (!s.good(), scan::score(s), s.fails, s.id.clone()));
                 v.into_iter().take(1).cloned().collect()
             }
@@ -431,13 +494,16 @@ impl Engine {
 
     /// Why a unit with this target currently falls back to the VPN ("" = fine).
     fn target_warn(st: &State, r: &Route, connected: bool) -> String {
+        let now = util::now();
         let warn = if !r.enabled || st.settings.routes.eff_entries(r) == 0 {
             String::new()
         } else {
             match &r.target {
                 Target::Server(id) => match st.servers.iter().find(|s| &s.id == id) {
                     None => "Сервер удалён — трафик идёт через VPN".into(),
-                    Some(s) if s.probe.as_ref().is_some_and(|p| !p.ok) => "Сервер не отвечает — трафик идёт через VPN".into(),
+                    Some(s) if s.disabled => "Сервер отключён — трафик идёт через VPN".into(),
+                    Some(s) if s.auth_error => "Требуется авторизация на сервере — трафик идёт через VPN".into(),
+                    Some(s) if s.circuit_open(now) || s.probe.as_ref().is_some_and(|p| !p.ok) => "Сервер не отвечает — трафик идёт через VPN".into(),
                     _ => String::new(),
                 },
                 Target::Chain(cid) => match st.settings.routes.chain(cid) {
@@ -464,11 +530,12 @@ impl Engine {
         }
     }
 
-    fn route_json(st: &State, r: &Route, connected: bool) -> Value {
+    fn route_json(st: &State, r: &Route, priority: usize, connected: bool) -> Value {
         let warn = Self::target_warn(st, r, connected);
         let linked = st.settings.routes.eff_entries(r) - r.entries();
         json!({
             "id": r.id,
+            "priority": priority,
             "name": r.name,
             "enabled": r.enabled,
             "target": r.target.code(),
@@ -499,7 +566,14 @@ impl Engine {
     pub(super) fn routes_view(&self) -> Value {
         let connected = self.connected();
         let st = self.st.lock().unwrap();
-        let list: Vec<Value> = st.settings.routes.list.iter().map(|r| Self::route_json(&st, r, connected)).collect();
+        let list: Vec<Value> = st
+            .settings
+            .routes
+            .list
+            .iter()
+            .enumerate()
+            .map(|(idx, r)| Self::route_json(&st, r, idx + 1, connected))
+            .collect();
         let chains: Vec<Value> = st.settings.routes.chains.iter().map(|c| Self::chain_json(&st, c)).collect();
         // countries a route can go through: working servers there
         let mut cc: HashMap<String, usize> = HashMap::new();
@@ -529,7 +603,7 @@ impl Engine {
             "issues": smart::lint(&st.settings.routes).into_iter().map(|i| i.text).collect::<Vec<_>>(),
             "countries": countries,
             "warp": warp,
-            "warp_good": !st.netp.as_ref().is_some_and(NetProfile::cf_blocked) && st.servers.iter().any(|s| s.origin == Origin::Warp && s.good()),
+            "warp_good": st.servers.iter().any(|s| s.origin == Origin::Warp && s.good()),
             "warp_note": super::warp_note(&st),
         })
     }
@@ -825,12 +899,11 @@ impl Engine {
         };
         self.want_warp(&t);
         self.routes_changed(&before).await?;
-        // `connected()` locks `st` itself: ask before taking the guard, a std
-        // mutex is not reentrant and locking it twice deadlocks the engine.
         let connected = self.connected();
         let st = self.st.lock().unwrap();
+        let idx = st.settings.routes.list.iter().position(|r| r.id == id).unwrap_or(0);
         let r = st.settings.routes.get(&id).cloned().ok_or("маршрут не найден")?;
-        Ok(Self::route_json(&st, &r, connected))
+        Ok(Self::route_json(&st, &r, idx + 1, connected))
     }
 
     pub(super) async fn route_update(self: &Arc<Self>, id: &str, name: Option<String>, enabled: Option<bool>, target: Option<String>, lists: Option<Vec<String>>, fallback: Option<String>, strategy: Option<String>) -> Result<Value, String> {
@@ -1040,8 +1113,9 @@ impl Engine {
                 self.route_update(&id, None, Some(true), Some(target.to_string()), None, None, None).await?;
                 let connected = self.connected();
                 let st = self.st.lock().unwrap();
+                let idx = st.settings.routes.list.iter().position(|r| r.id == id).unwrap_or(0);
                 let r = st.settings.routes.get(&id).cloned().ok_or("маршрут не найден")?;
-                let mut v = Self::route_json(&st, &r, connected);
+                let mut v = Self::route_json(&st, &r, idx + 1, connected);
                 v["moved"] = json!(moved);
                 Ok(v)
             }
@@ -1094,27 +1168,50 @@ impl Engine {
         Ok(json!({ "moved": moved }))
     }
 
-    /// "Where will this go?" in plain words.
+    /// "Where will this go?" in plain words, including rule priority, hop sequence, and availability.
     pub(super) fn route_explain(&self, query: &str) -> Value {
+        let connected = self.connected();
         let st = self.st.lock().unwrap();
         let ex = smart::explain(&st.settings.routes, query);
         let what = match &ex.subject {
-            smart::Subject::Site(s) => s.clone(),
+            smart::Subject::Site(s) => match ex.port {
+                Some(p) => format!("{s}:{p}"),
+                None => s.clone(),
+            },
             smart::Subject::App(a) => a.clone(),
-            smart::Subject::Invalid => return json!({ "ok": false, "text": "Не похоже на адрес сайта или имя программы" }),
+            smart::Subject::Invalid => return json!({ "ok": false, "text": "Не похоже на адрес сайта, IP или имя программы (.exe)" }),
         };
         let mut lines: Vec<String> = Vec::new();
+        let chosen_target = ex.target();
         match ex.winner() {
             Some(h) => {
-                let why = if h.entry == what { format!("«{}»", h.name) } else { format!("«{}» (правило {})", h.name, h.entry) };
+                let why = if Some(&h.entry) == match &ex.subject { smart::Subject::Site(s) => Some(s), smart::Subject::App(a) => Some(a), _ => None } {
+                    format!("«{}» (Приоритет № {})", h.name, h.priority)
+                } else {
+                    format!("«{}» (Приоритет № {}, совпадение: {})", h.name, h.priority, h.entry)
+                };
                 lines.push(format!("{what} → {}. Решает маршрут {why}.", label(&st, &h.target)));
+                lines.push(format!("Цепочка прохождения: {}.", explain_path(&st, &h.target)));
+                if let Some(unit) = st.settings.routes.units().into_iter().find(|u| u.id == h.unit_id) {
+                    let w = Self::target_warn(&st, &unit, connected);
+                    if !w.is_empty() {
+                        lines.push(format!("Внимание: {w}."));
+                    }
+                }
                 for o in ex.hits.iter().skip(1) {
-                    lines.push(format!("Также подходит «{}» ({}), но он ниже по списку — не сработает.", o.name, label(&st, &o.target)));
+                    lines.push(format!("Также подходит маршрут № {} «{}» ({}), но он ниже по приоритету — не сработает.", o.priority, o.name, label(&st, &o.target)));
                 }
             }
-            None => lines.push(format!("{what} → {}. Ни один маршрут не подошёл — действует «Остальной трафик».", label(&st, &ex.default))),
+            None => {
+                lines.push(format!("{what} → {}. Ни один специальный маршрут не подошёл — действует правило «Остальной трафик».", label(&st, &ex.default)));
+                lines.push(format!("Цепочка прохождения: {}.", explain_path(&st, &ex.default)));
+            }
         }
-        json!({ "ok": true, "text": lines.join("\n"), "target": ex.target().code() })
+        if ex.port == Some(80) && st.settings.https_only_free {
+            let mode = if st.settings.http_allow_direct { "напрямую (мимо публичных серверов)" } else { "только через свой сервер/WARP или блокируется (защита от перехвата HTTP)" };
+            lines.push(format!("Порт 80 (нешифрованный HTTP): {mode}."));
+        }
+        json!({ "ok": true, "text": lines.join("\n"), "target": chosen_target.code() })
     }
 
     /// One-step rule: `value` (a site or a program) goes to `target`. The route that
@@ -1169,8 +1266,9 @@ impl Engine {
     }
 
     /// Watch over routes with their own servers (from the watchdog): which of them use
-    /// the VPN as a spare right now; their servers are re-tested so they come back.
-    pub(super) async fn route_health(&self, api: &mihomo::Api) {
+    /// the VPN as a spare right now; their servers are re-tested and dead servers are
+    /// marked failed + circuit-broken so mihomo stops hammering dead IPs in `R-<id>-s`.
+    pub(super) async fn route_health(self: &Arc<Self>, api: &mihomo::Api) {
         let plans = self.applied.lock().unwrap().opts.as_ref().map(|o| o.routes.clone()).unwrap_or_default();
         let watched: Vec<&RoutePlan> = plans.iter().filter(|p| matches!(p.via, Via::Servers(_) | Via::Chain(_))).collect();
         if watched.is_empty() {
@@ -1183,6 +1281,7 @@ impl Engine {
             now.saturating_sub(st.last_route_check) >= 60
         };
         let mut spare = HashSet::new();
+        let mut evicted_any = false;
         for p in &watched {
             let id = &p.id;
             let g = mihomo::route_group(id);
@@ -1196,6 +1295,14 @@ impl Engine {
                         _ => unreachable!(),
                     };
                     let alive = api.group_delay(&inner, mihomo::TEST_URL, 4000).await;
+                    if let Via::Servers(sids) = &p.via {
+                        for sid in sids {
+                            if !alive.contains_key(sid) {
+                                self.mark_failed(sid);
+                                evicted_any = true;
+                            }
+                        }
+                    }
                     if !alive.is_empty() {
                         let _ = api.group_delay(&g, mihomo::TEST_URL, 4000).await;
                         if api.now(&g).await.as_deref() != Some("VPN") {
@@ -1223,6 +1330,10 @@ impl Engine {
         if !names.is_empty() {
             self.log(&format!("маршрут на запасном пути (через VPN): {}", names.join(", ")));
         }
+        if evicted_any {
+            self.save_servers();
+            self.apply_pool().await;
+        }
     }
 }
 
@@ -1233,14 +1344,14 @@ mod tests {
     fn server(host: &str, origin: Origin) -> Server {
         let p = serde_json::json!({"type":"trojan","server":host,"port":443,"password":"x"});
         let mut s = Server::new(host, p.as_object().unwrap().clone(), origin, "test").unwrap();
-        s.probe = Some(Probe { ok:true, latency:Some(20), ..Default::default() });
+        s.probe = Some(Probe { ok: true, latency: Some(20), exit_ip: Some("203.0.113.9".into()), exit_cc: Some("NL".into()), ..Default::default() });
         s
     }
 
     #[test]
     fn warp_chain_reuses_neither_pool_key_nor_later_vpn_as_direct() {
         let path = std::env::temp_dir().join(format!("lazeyka-chain-test-{}", util::random_token(10)));
-        let e = Engine::new(Paths { data:path.clone(), bin:path.clone() }, "test");
+        let e = Engine::new(Paths { data: path.clone(), bin: path.clone() }, "test");
         let free = server("198.51.100.2", Origin::Free);
         let warp = server("198.51.100.3", Origin::Warp);
         let chain = Chain::new("WARP → VPN", vec![Hop::Warp, Hop::Auto]);
@@ -1268,10 +1379,10 @@ mod tests {
     }
 
     #[test]
-    fn default_server_gets_virtual_plan_and_provider_entry() {
+    fn default_server_gets_virtual_plan_and_evicts_dead_server() {
         let path = std::env::temp_dir().join(format!("lazeyka-default-test-{}", util::random_token(10)));
-        let e = Engine::new(Paths { data:path.clone(), bin:path.clone() }, "test");
-        let s = server("198.51.100.9", Origin::Free);
+        let e = Engine::new(Paths { data: path.clone(), bin: path.clone() }, "test");
+        let s = server("95.213.245.84", Origin::Free);
         {
             let mut st = e.st.lock().unwrap();
             st.servers.push(s.clone());
@@ -1280,6 +1391,12 @@ mod tests {
         let (plans, extra, _, _) = e.route_plans(&[]);
         assert!(plans.iter().any(|p| p.id == mihomo::DEFAULT_ROUTE && p.via == Via::Servers(vec![s.id.clone()])));
         assert!(extra.iter().any(|x| x.id == s.id));
+
+        // When 95.213.245.84 fails, mark_failed evicts it from R-__default-s so it is no longer hammered
+        e.mark_failed(&s.id);
+        let (plans2, extra2, _, _) = e.route_plans(&[]);
+        assert!(plans2.iter().all(|p| p.id != mihomo::DEFAULT_ROUTE));
+        assert!(extra2.is_empty());
         let _ = std::fs::remove_dir_all(path);
     }
 }

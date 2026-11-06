@@ -2,7 +2,7 @@
 //! (plain WireGuard and AmneziaWG with junk packets / QUIC-like I1), tested by the scanner.
 
 use crate::links::{WgFields, wg_proxy};
-use crate::model::{Origin, Server};
+use crate::model::{FreeTierLimits, Origin, Server};
 use crate::util::{b64_decode, b64_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -21,6 +21,13 @@ pub struct Account {
     pub reserved: Vec<u8>,
     pub peer_key: String,
     pub registered: u64,
+}
+
+impl Account {
+    /// True when the account has a valid device id, private key, and IPv4 address.
+    pub fn usable(&self) -> bool {
+        !self.id.is_empty() && b64_decode(&self.private_key).is_some_and(|b| b.len() == 32) && !self.v4.is_empty()
+    }
 }
 
 pub fn keypair() -> (String, String) {
@@ -104,7 +111,7 @@ pub async fn register(client: &reqwest::Client) -> Result<Account, String> {
             peer_key: cfg["peers"][0]["public_key"].as_str().unwrap_or(PEER_KEY).to_string(),
             registered: crate::util::now(),
         };
-        if acc.id.is_empty() {
+        if !acc.usable() {
             return Err("WARP: регистрация не удалась".into());
         }
         return Ok(acc);
@@ -171,7 +178,15 @@ pub fn server(acc: &Account, ep: (&str, u16), v: Variant) -> Result<Server, Stri
     };
     let proxy = wg_proxy(&f)?;
     let name = format!("Cloudflare WARP · {} · {}:{}", variant_name(v), ep.0, ep.1);
-    Server::new(&name, proxy, Origin::Warp, "warp")
+    let mut srv = Server::new(&name, proxy, Origin::Warp, "warp")?;
+    srv.limits = Some(FreeTierLimits {
+        traffic_mb: 0,
+        traffic_mb_month: None,
+        speed_kbps: 0,
+        max_devices: 1,
+        note: "Безлимитный трафик · 1 устройство на ключ".into(),
+    });
+    Ok(srv)
 }
 
 /// All WARP variants for the scanner.
@@ -207,9 +222,11 @@ mod tests {
             peer_key: PEER_KEY.into(),
             registered: 0,
         };
+        assert!(acc.usable());
         let s = servers(&acc);
         assert_eq!(s.len(), ENDPOINTS.len() * 3);
         assert_eq!(s[0].proto, crate::model::Proto::Awg);
         assert_eq!(s[2].proto, crate::model::Proto::Wireguard);
+        assert!(s[0].limits.is_some());
     }
 }

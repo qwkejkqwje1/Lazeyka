@@ -3,7 +3,7 @@
 //!  "routes":[{"id":"r1","via":"direct"|"vpn"|"block"|"chain:<id>"|["id1","id2"]}],
 //!  "chains":[{"id":"c1","levels":[[<proxy>,...],...]}],
 //!  "default_chain":"c1"}
-use lazeyka_core::mihomo::{self, RoutePlan, Via};
+use lazeyka_core::mihomo::{self, RoutePlan, Spare, Via};
 use serde_json::Value;
 use std::io::Read;
 
@@ -24,6 +24,8 @@ fn main() {
                 Value::Array(a) => Via::Servers(a.iter().map(|x| x.as_str().unwrap().to_string()).collect()),
                 _ => Via::Vpn,
             },
+            spare: Spare::Vpn,
+            strategy: Default::default(),
         })
         .collect();
     let chains = v["chains"]
@@ -42,8 +44,10 @@ fn main() {
         secret: "test".into(),
         default_direct: v["default_direct"].as_bool().unwrap_or(false),
         default_chain: v["default_chain"].as_str().map(str::to_string),
+        http_policy: None,
         routes,
         chains,
+        hops: vec![],
         stack: "gvisor".into(),
         strict_route: true,
         ipv6: false,

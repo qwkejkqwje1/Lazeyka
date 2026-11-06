@@ -48,12 +48,19 @@ fn item(name: &str, cc: &str, proto: &str, tr: &str, lat: i32, speed: &str, mine
         checks: if lat > 0 { "24 проверки".into() } else { "3 проверки".into() },
         address: format!("{}.example.net:443", cc.to_lowercase()).into(),
         checked: "04.11.2026 18:42".into(),
+        relay: "".into(),
+        exit_ip: if lat > 0 { "203.0.113.42".into() } else { "".into() },
+        state_label: if lat > 0 { "Страна подтверждена".into() } else { "Временно недоступен".into() },
+        trust_label: if mine { "Свой сервер".into() } else if warp { "Официальный бесплатный".into() } else { "Публичный узел".into() },
+        trust_warning: "".into(),
+        limits_note: "".into(),
     }
 }
 
 fn route(id: &str, name: &str, kind: &str, cc: &str, label: &str, summary: &str, warn: &str, enabled: bool, first: bool, last: bool) -> RouteItem {
     RouteItem {
         id: id.into(),
+        priority: 1,
         name: name.into(),
         enabled,
         target: kind.into(),
@@ -62,6 +69,8 @@ fn route(id: &str, name: &str, kind: &str, cc: &str, label: &str, summary: &str,
         label: label.into(),
         summary: summary.into(),
         warn: warn.into(),
+        fallback: "fastest".into(),
+        strategy: "failover".into(),
         first,
         last,
     }
@@ -102,7 +111,7 @@ fn main() {
     window.set_size(slint::PhysicalSize::new(w, h));
     ui.show().unwrap();
     let app = ui.global::<App>();
-    app.set_version("0.4.0".into());
+    app.set_version("0.8.0".into());
     app.set_core_version("v1.19.33".into());
     app.set_good_count(56);
     app.set_mine_count(2);
@@ -158,7 +167,7 @@ fn main() {
         SourceItem { id: "b".into(), name: "kort0881: Hysteria2".into(), tier: 2, enabled: true, stat: "рабочих 12 из 90".into(), custom: false },
         SourceItem { id: "c".into(), name: "Мой список".into(), tier: 1, enabled: false, stat: "ещё не загружен".into(), custom: true },
     ])));
-    app.set_log_lines(ModelRc::new(VecModel::from(vec![SharedString::from("12:00:01 Лазейка 0.1.0 запущена"), "12:00:05 поиск завершён: рабочих серверов 56".into(), "--- mihomo ---".into(), "level=warning msg=...".into()])));
+    app.set_log_lines(ModelRc::new(VecModel::from(vec![SharedString::from("12:00:01 Лазейка 0.8.0 запущена"), "12:00:05 поиск завершён: рабочих серверов 56".into(), "--- mihomo ---".into(), "level=warning msg=...".into()])));
 
     let shots: Vec<(&str, Box<dyn Fn(&App)>)> = vec![
         ("01-home-off", Box::new(|a: &App| { a.set_page(0); a.set_state(0); a.set_state_text("Отключено".into()); a.set_message("Нажмите, чтобы подключиться".into()); })),
@@ -186,7 +195,7 @@ fn main() {
         ("17-countries", Box::new(|a: &App| { a.set_dialog("countries".into()); })),
         ("18-location", Box::new(|a: &App| { a.set_location_blocked(false); a.set_location_text("Лазейка будет работать прямо из этой папки:\nC:\\Users\\Иван\\Downloads\\Lazeyka\n\nПапка находится в профиле пользователя. Программы, запущенные от вашего имени, смогут переместить её и подменить файлы службы, которая работает с правами системы.\n\nНадёжнее перенести папку Лазейки, например, в C:\\Lazeyka и запустить программу оттуда. Продолжить установку здесь?".into()); a.set_dialog("location".into()); })),
         ("19-location-blocked", Box::new(|a: &App| { a.set_location_blocked(true); a.set_location_text("Рядом с lazeyka.exe нет файла mihomo.exe. Похоже, программа запущена прямо из архива: распакуйте его целиком («Извлечь всё…») в отдельную папку, например C:\\Lazeyka, и запустите lazeyka.exe оттуда.".into()); a.set_dialog("location".into()); })),
-        ("20-auto-warn", Box::new(|a: &App| { a.set_dialog("".into()); a.set_auto_warn(true); a.set_auto_sub("Нет рабочих в NL, DE, FI — используем любые".into()); a.set_countries_text("NL, DE +1".into()); })),
+        ("20-auto-warn", Box::new(|a: &App| { a.set_dialog("".into()); a.set_auto_warn(true); a.set_auto_sub("В NL, DE, FI пока нет рабочих серверов — нажмите «Найти»".into()); a.set_countries_text("NL, DE +1".into()); })),
         ("21-about", Box::new(|a: &App| { a.set_page(3); a.set_dialog("about".into()); })),
         ("22-uninstall", Box::new(|a: &App| { a.set_dialog("uninstall".into()); })),
     ];

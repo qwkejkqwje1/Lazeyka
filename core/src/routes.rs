@@ -260,7 +260,8 @@ impl Serialize for Target {
 
 impl<'de> Deserialize<'de> for Target {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        // lenient: a broken value must not make the whole settings file unreadable
+        // lenient: a broken value must not make the whole settings file unreadable,
+        // while Route::validate_raw surfaces any unknown target string in diagnostics.
         let s = String::deserialize(d)?;
         Ok(Target::parse(&s).unwrap_or(Target::Vpn))
     }

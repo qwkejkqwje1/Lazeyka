@@ -34,6 +34,18 @@ export struct ServerItem {
     address: string,
     // date of the last check
     checked: string,
+    // entry hop name if connected via 2-hop relay ("" = direct)
+    relay: string,
+    // verified exit IP
+    exit-ip: string,
+    // multi-stage state label
+    state-label: string,
+    // trust level label
+    trust-label: string,
+    // warning for untrusted public nodes
+    trust-warning: string,
+    // optional free-tier limits
+    limits-note: string,
 }
 
 export struct CountryItem {
@@ -46,6 +58,7 @@ export struct CountryItem {
 // A route: chosen sites and programs go their own way.
 export struct RouteItem {
     id: string,
+    priority: int,
     name: string,
     enabled: bool,
     // "direct", "vpn", "warp", "block", "country:DE", "server:<id>"
@@ -136,6 +149,9 @@ export global App {
     in property <string> cur-name: "Автовыбор";
     in property <string> cur-cc;
     in property <string> cur-detail: "Лучший из доступных серверов";
+    in property <string> cur-ip;
+    in property <string> cur-relay;
+    in property <string> cur-trust;
     in property <bool> cur-warp;
     in property <bool> auto: true;
     in property <string> down;
@@ -151,6 +167,7 @@ export global App {
     in property <bool> auto-update: true;
     in property <bool> relay-scan: true;
     in property <bool> https-only-free: true;
+    in property <bool> http-allow-direct: false;
     callback check-updates();
     callback install-program-update();
     callback install-mihomo-update();

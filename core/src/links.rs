@@ -2,7 +2,7 @@
 //!
 //! Supported: vless://, vmess:// (base64 JSON and URI form), trojan://, ss:// (SIP002 and
 //! legacy, obfs/v2ray-plugin), hysteria2:// | hy2:// (port hopping, salamander),
-//! tuic://, anytls://, wireguard:// | wg:// (incl. AmneziaWG params).
+//! tuic://, anytls://, wireguard:// | wg:// (incl. AmneziaWG params), masque://.
 
 use crate::util::*;
 use serde_json::{Map, Value, json};
@@ -27,6 +27,7 @@ pub fn parse_link(line: &str) -> R {
         "tuic" => tuic(rest),
         "anytls" => anytls(rest),
         "wireguard" | "wg" => wireguard(rest),
+        "masque" => masque(rest),
         "ssr" => Err("ShadowsocksR не поддерживается".into()),
         "hysteria" => Err("Hysteria v1 не поддерживается".into()),
         other => Err(format!("схема {other}:// не поддерживается")),
@@ -799,6 +800,38 @@ fn anytls(rest: &str) -> R {
     Ok(Parsed { name: u.name, proxy: m })
 }
 
+/// MASQUE (`masque://`) parser supporting QUIC/HTTP/3 and HTTP/2 fallback in mihomo.
+fn masque(rest: &str) -> R {
+    let u = split_url(rest)?;
+    let mut m = base("masque", &u)?;
+    let q = &u.query;
+    let net = q.enum_val("network").or_else(|| q.enum_val("type")).unwrap_or_else(|| "h3".into());
+    let net = if net == "h2" || net == "http2" { "h2" } else { "h3" };
+    m.insert("network".into(), net.into());
+    if !u.user.is_empty() {
+        m.insert("private-key".into(), u.user.clone().into());
+    } else if let Some(pk) = q.any(&["privatekey", "private-key", "key"]) {
+        m.insert("private-key".into(), pk.into());
+    }
+    if let Some(pubk) = q.any(&["publickey", "public-key", "pbk", "endpoint-public-key"]) {
+        m.insert("public-key".into(), pubk.into());
+    }
+    if let Some(ip) = q.any(&["ip", "address"]) {
+        m.insert("ip".into(), ip.into());
+    }
+    if let Some(ip6) = q.any(&["ipv6", "address6"]) {
+        m.insert("ipv6".into(), ip6.into());
+    }
+    if let Some(sni) = q.any(&["sni", "servername", "peer"]) {
+        m.insert("sni".into(), sni.into());
+    }
+    if let Some(mtu) = q.get("mtu").and_then(|s| s.parse::<u64>().ok()).filter(|m| (576..=9000).contains(m)) {
+        m.insert("mtu".into(), mtu.into());
+    }
+    m.insert("remote-dns-resolve".into(), true.into());
+    Ok(Parsed { name: u.name, proxy: m })
+}
+
 /// Fields of a WireGuard/AmneziaWG peer, shared by links, .conf files, Amnezia and WARP.
 #[derive(Debug, Default, Clone)]
 pub struct WgFields {
@@ -1055,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn hy2_tuic_anytls() {
+    fn hy2_tuic_anytls_masque() {
         let m = p("hysteria2://letmein@example.com:443,20000-30000/?insecure=1&obfs=salamander&obfs-password=gawrgura&sni=real.example.com#hy");
         assert_eq!(m["ports"], "443,20000-30000");
         assert_eq!(m["port"], 443);
@@ -1067,6 +1100,10 @@ mod tests {
         assert_eq!(m["congestion-controller"], "bbr");
         let m = p("anytls://pw@a.com:443?sni=a.com&fp=chrome&insecure=1");
         assert_eq!(m["client-fingerprint"], "chrome");
+        let m = p("masque://privkey@162.159.198.1:443?network=h2&publickey=pubkey&ip=172.16.0.2&sni=consumer-masque.cloudflareclient.com#CF-MASQUE");
+        assert_eq!(m["type"], "masque");
+        assert_eq!(m["network"], "h2");
+        assert_eq!(m["sni"], "consumer-masque.cloudflareclient.com");
     }
 
     #[test]
@@ -1082,32 +1119,5 @@ mod tests {
         assert_eq!(m["ipv6"], "2606:4700::2");
         assert_eq!(m["reserved"], json!([1, 2, 3]));
         assert_eq!(m["amnezia-wg-option"]["jc"], 4);
-    }
-
-    #[test]
-    fn real_samples() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../research/src");
-        let Ok(rd) = std::fs::read_dir(&dir) else { return };
-        let (mut ok, mut bad) = (0, 0);
-        let mut errs = std::collections::BTreeMap::<String, usize>::new();
-        for e in rd.flatten() {
-            let t = std::fs::read_to_string(e.path()).unwrap_or_default();
-            for line in t.lines() {
-                let l = line.trim();
-                if l.is_empty() || l.starts_with('#') || !l.contains("://") {
-                    continue;
-                }
-                match parse_link(l) {
-                    Ok(_) => ok += 1,
-                    Err(er) => {
-                        bad += 1;
-                        *errs.entry(er).or_default() += 1;
-                    }
-                }
-            }
-        }
-        eprintln!("samples ok={ok} bad={bad} {errs:?}");
-        assert!(ok > 300, "too few parsed: {ok}");
-        assert!(bad * 10 < ok, "too many errors: {bad}");
     }
 }

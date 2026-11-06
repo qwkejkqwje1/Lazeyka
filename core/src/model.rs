@@ -1,4 +1,4 @@
-//! Core data model: servers, probe results.
+//! Core data model: servers, probe results, verification states, trust levels, and free-tier limits.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -17,6 +17,7 @@ pub enum Proto {
     Wireguard,
     Awg,
     Openvpn,
+    Masque,
 }
 
 impl Proto {
@@ -32,6 +33,7 @@ impl Proto {
             Proto::Wireguard => "WireGuard",
             Proto::Awg => "AmneziaWG",
             Proto::Openvpn => "OpenVPN",
+            Proto::Masque => "MASQUE",
         }
     }
     pub fn all() -> &'static [Proto] {
@@ -46,6 +48,7 @@ impl Proto {
             Proto::Wireguard,
             Proto::Awg,
             Proto::Openvpn,
+            Proto::Masque,
         ]
     }
     /// Classifies a mihomo proxy definition.
@@ -66,12 +69,13 @@ impl Proto {
                 }
             }
             "openvpn" => Proto::Openvpn,
+            "masque" => Proto::Masque,
             _ => return None,
         })
     }
     /// Transport runs over UDP (TCP pre-checks are meaningless).
     pub fn udp_based(self) -> bool {
-        matches!(self, Proto::Hysteria2 | Proto::Tuic | Proto::Wireguard | Proto::Awg)
+        matches!(self, Proto::Hysteria2 | Proto::Tuic | Proto::Wireguard | Proto::Awg | Proto::Masque)
     }
 }
 
@@ -85,6 +89,114 @@ pub enum Origin {
     Free,
     /// Built-in Cloudflare WARP profile.
     Warp,
+}
+
+/// Trust category of a server source: official free providers and user-owned servers
+/// are never mixed with untrusted public community nodes.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustLevel {
+    UserOwned,
+    OfficialFree,
+    PublicCommunity,
+}
+
+impl TrustLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            TrustLevel::UserOwned => "Свой сервер",
+            TrustLevel::OfficialFree => "Официальный бесплатный",
+            TrustLevel::PublicCommunity => "Публичный узел",
+        }
+    }
+
+    pub fn warning(self) -> Option<&'static str> {
+        match self {
+            TrustLevel::PublicCommunity => Some(
+                "Публичный узел: оператор сервера может видеть метаданные соединений и незашифрованный HTTP-трафик. Для банков и личных кабинетов используйте только HTTPS.",
+            ),
+            _ => None,
+        }
+    }
+}
+
+/// Detailed lifecycle & verification state of a server (Section 6).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerState {
+    #[default]
+    Found,
+    ConfigValid,
+    ReachableDirect,
+    ReachableRelay,
+    HandshakeOk,
+    InternetOk,
+    CountryVerified,
+    Unstable,
+    TempUnavailable,
+    AuthRequired,
+    Disabled,
+}
+
+impl ServerState {
+    pub fn label(self) -> &'static str {
+        match self {
+            ServerState::Found => "Найден",
+            ServerState::ConfigValid => "Конфигурация корректна",
+            ServerState::ReachableDirect => "Доступен напрямую",
+            ServerState::ReachableRelay => "Доступен через входное звено",
+            ServerState::HandshakeOk => "VPN установлен",
+            ServerState::InternetOk => "Интернет работает",
+            ServerState::CountryVerified => "Страна подтверждена",
+            ServerState::Unstable => "Нестабилен",
+            ServerState::TempUnavailable => "Временно недоступен",
+            ServerState::AuthRequired => "Требует авторизации",
+            ServerState::Disabled => "Отключён пользователем",
+        }
+    }
+}
+
+/// Optional limits of a free provider tier.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FreeTierLimits {
+    /// Monthly or session traffic cap in MiB (0 = unlimited).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub traffic_mb: u64,
+    /// Optional explicit monthly traffic cap in MiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_mb_month: Option<u64>,
+    /// Speed cap in kbit/s (0 = unlimited).
+    #[serde(default, skip_serializing_if = "is_zero32")]
+    pub speed_kbps: u32,
+    /// Simultaneous device limit (0 = unlimited).
+    #[serde(default, skip_serializing_if = "is_zero8")]
+    pub max_devices: u8,
+    /// Human-readable note on free tier conditions.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
+impl FreeTierLimits {
+    pub fn summary(&self) -> Option<String> {
+        if !self.note.is_empty() {
+            return Some(self.note.clone());
+        }
+        let mut parts = Vec::new();
+        if let Some(mb) = self.traffic_mb_month.or_else(|| (self.traffic_mb > 0).then_some(self.traffic_mb)) {
+            if mb >= 1024 {
+                parts.push(format!("Лимит: {} ГБ/мес", mb / 1024));
+            } else {
+                parts.push(format!("Лимит: {} МБ/мес", mb));
+            }
+        }
+        if self.speed_kbps > 0 {
+            parts.push(format!("до {} Мбит/с", (self.speed_kbps / 1000).max(1)));
+        }
+        if self.max_devices > 0 {
+            parts.push(format!("устройств: {}", self.max_devices));
+        }
+        if parts.is_empty() { None } else { Some(parts.join(" · ")) }
+    }
 }
 
 /// Services bitmask in [`Probe::services`].
@@ -103,7 +215,7 @@ pub struct Probe {
     pub latency: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_ip: Option<String>,
-    /// ISO country of the exit IP (DB-IP Lite).
+    /// ISO country of the exit IP (DB-IP Lite / trace).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_cc: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -134,7 +246,7 @@ pub struct Server {
     pub proxy: Map<String, Value>,
     #[serde(default)]
     pub origin: Origin,
-    /// Source id (catalog source, subscription id, "manual").
+    /// Source id (catalog source, subscription id, provider id, "manual").
     #[serde(default)]
     pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -159,12 +271,24 @@ pub struct Server {
     #[serde(default, skip_serializing_if = "is_zero8")]
     pub hist_n: u8,
     /// The server answers only through this working server (its id): the direct path from
-    /// here is blocked, the entry hop gets the connection out. TCP-based protocols only.
+    /// here is blocked, the entry hop gets the connection out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<String>,
     /// Last attempt to test the server through an entry hop (unix seconds).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub relay_at: u64,
+    /// Explicitly disabled by the user.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disabled: bool,
+    /// Last check failed due to authentication/token expiration rather than network/server death.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub auth_error: bool,
+    /// Circuit breaker open until this unix timestamp (seconds).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cb_until: u64,
+    /// Optional free-tier limitations associated with this server/provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<FreeTierLimits>,
 }
 
 /// Name of the config-level copy of a working server that relay servers dial through.
@@ -183,6 +307,21 @@ fn is_zero8(v: &u8) -> bool {
 }
 fn is_false(v: &bool) -> bool {
     !*v
+}
+
+/// Detects whether an error string represents an authentication, password, or token failure.
+pub fn is_auth_failure(err: &str) -> bool {
+    let l = err.to_lowercase();
+    l.contains("auth")
+        || l.contains("авториз")
+        || l.contains("пароль")
+        || l.contains("токен")
+        || l.contains("token")
+        || l.contains("unauthorized")
+        || l.contains("forbidden")
+        || l.contains("http 401")
+        || l.contains("http 403")
+        || l.contains("логин")
 }
 
 impl Server {
@@ -217,6 +356,10 @@ impl Server {
             hist_n: 0,
             relay: None,
             relay_at: 0,
+            disabled: false,
+            auth_error: false,
+            cb_until: 0,
+            limits: None,
         })
     }
 
@@ -230,9 +373,78 @@ impl Server {
         Value::Object(m)
     }
 
+    /// True when the server has verified internet access and is not disabled or auth-blocked.
     pub fn good(&self) -> bool {
-        self.probe.as_ref().is_some_and(|p| p.ok)
+        !self.disabled && !self.auth_error && self.probe.as_ref().is_some_and(|p| p.ok && p.exit_ip.is_some())
     }
+
+    /// True when the circuit breaker is currently open for this server at `now`.
+    pub fn circuit_open(&self, now: u64) -> bool {
+        self.cb_until > now
+    }
+
+    /// Trips the circuit breaker for an exponentially scaled pause (30 s .. 30 min).
+    pub fn trip_circuit(&mut self, now: u64) {
+        let shift = self.fails.saturating_sub(1).min(6);
+        let pause = (30u64 << shift).min(1800);
+        self.cb_until = now.saturating_add(pause);
+    }
+
+    /// Trust level of the server.
+    pub fn trust_level(&self) -> TrustLevel {
+        match self.origin {
+            Origin::Mine => TrustLevel::UserOwned,
+            Origin::Warp => TrustLevel::OfficialFree,
+            Origin::Free => {
+                if self.source.starts_with("official:") {
+                    TrustLevel::OfficialFree
+                } else {
+                    TrustLevel::PublicCommunity
+                }
+            }
+        }
+    }
+
+    /// Security warning for untrusted public community nodes.
+    pub fn trust_warning(&self) -> Option<&'static str> {
+        self.trust_level().warning()
+    }
+
+    /// Detailed state of the server according to the 11-state verification model.
+    pub fn state(&self, now: u64) -> ServerState {
+        if self.disabled {
+            return ServerState::Disabled;
+        }
+        if self.auth_error {
+            return ServerState::AuthRequired;
+        }
+        if self.circuit_open(now) {
+            return ServerState::TempUnavailable;
+        }
+        let Some(p) = &self.probe else {
+            return ServerState::ConfigValid;
+        };
+        if p.error.as_deref().is_some_and(is_auth_failure) {
+            return ServerState::AuthRequired;
+        }
+        if !p.ok {
+            return ServerState::TempUnavailable;
+        }
+        if p.exit_ip.is_none() {
+            return ServerState::HandshakeOk;
+        }
+        if self.hist_n >= 4 && self.stability().is_some_and(|st| st < 50) {
+            return ServerState::Unstable;
+        }
+        if self.relay.is_some() {
+            return ServerState::ReachableRelay;
+        }
+        if p.exit_cc.is_some() {
+            return ServerState::CountryVerified;
+        }
+        ServerState::InternetOk
+    }
+
     pub fn latency(&self) -> Option<u32> {
         self.probe.as_ref().filter(|p| p.ok).and_then(|p| p.latency)
     }
@@ -315,6 +527,7 @@ pub fn transport_label(proto: Proto, p: &Map<String, Value>) -> String {
         "grpc" => "gRPC",
         "xhttp" => "XHTTP",
         "h2" => "H2",
+        "h3" => "H3",
         "http" => "HTTP",
         "mkcp" => "mKCP",
         _ => "",
@@ -380,6 +593,13 @@ pub fn transport_label(proto: Proto, p: &Map<String, Value>) -> String {
         }
         Proto::Wireguard => {}
         Proto::Openvpn => parts.push(s("proto").to_ascii_uppercase()),
+        Proto::Masque => {
+            if net == "h2" {
+                parts.push("HTTP/2".into());
+            } else {
+                parts.push("QUIC·H3".into());
+            }
+        }
     }
     parts.join("·")
 }
@@ -413,6 +633,43 @@ mod tests {
         let old: Server = serde_json::from_value(v).unwrap();
         assert_eq!(old.stability(), None);
         assert!(!old.fav);
+    }
+
+    #[test]
+    fn server_states_and_trust() {
+        let p: Map<String, Value> = serde_json::from_str(r#"{"type":"masque","server":"162.159.198.1","port":443,"network":"h2"}"#).unwrap();
+        let mut s = Server::new("MASQUE test", p, Origin::Free, "public-list").unwrap();
+        assert_eq!(s.proto, Proto::Masque);
+        assert_eq!(s.transport, "HTTP/2");
+        assert_eq!(s.trust_level(), TrustLevel::PublicCommunity);
+        assert!(s.trust_warning().is_some());
+        assert_eq!(s.state(100), ServerState::ConfigValid);
+
+        // TCP/handshake without exit IP must NOT make server `good()`
+        s.probe = Some(Probe { at: 100, ok: true, latency: Some(40), exit_ip: None, ..Default::default() });
+        assert!(!s.good());
+        assert_eq!(s.state(100), ServerState::HandshakeOk);
+
+        // Verified exit IP and country
+        s.probe = Some(Probe { at: 100, ok: true, latency: Some(40), exit_ip: Some("203.0.113.9".into()), exit_cc: Some("DE".into()), ..Default::default() });
+        assert!(s.good());
+        assert_eq!(s.state(100), ServerState::CountryVerified);
+
+        // Relay server reports ReachableRelay even when exit_cc is present
+        s.relay = Some("hop1".into());
+        assert_eq!(s.state(100), ServerState::ReachableRelay);
+        s.relay = None;
+
+        // Circuit breaker open -> TempUnavailable
+        s.fails = 3;
+        s.trip_circuit(100);
+        assert_eq!(s.state(110), ServerState::TempUnavailable);
+        s.cb_until = 0;
+
+        // Auth error state
+        s.auth_error = true;
+        assert!(!s.good());
+        assert_eq!(s.state(100), ServerState::AuthRequired);
     }
 
     #[test]

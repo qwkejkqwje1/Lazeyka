@@ -1,7 +1,7 @@
 import { Theme } from "theme.slint";
 import { Icon } from "icons.slint";
 import { App } from "state.slint";
-import { Clickable, Badge, Bar, Btn, IconButton } from "widgets.slint";
+import { Clickable, Badge, Bar, Btn, IconButton, Pill } from "widgets.slint";
 
 component PowerButton inherits Rectangle {
     in property <int> state;
@@ -74,7 +74,7 @@ export component HomePage inherits Rectangle {
         padding-right: 18px;
         padding-top: 4px;
         padding-bottom: 14px;
-        spacing: 10px;
+        spacing: 8px;
         if App.service != 0: Rectangle {
             height: note.preferred-height + 20px;
             border-radius: 12px;
@@ -105,7 +105,7 @@ export component HomePage inherits Rectangle {
                 }
             }
         }
-        Rectangle { vertical-stretch: 1; min-height: 4px; }
+        Rectangle { vertical-stretch: 1; min-height: 2px; }
         HorizontalLayout {
             alignment: center;
             PowerButton {
@@ -114,7 +114,7 @@ export component HomePage inherits Rectangle {
             }
         }
         VerticalLayout {
-            spacing: 4px;
+            spacing: 3px;
             Text {
                 text: App.state-text;
                 color: App.state == 2 ? Theme.accent : App.state == 3 ? Theme.err : Theme.text;
@@ -130,8 +130,16 @@ export component HomePage inherits Rectangle {
                 wrap: word-wrap;
                 min-height: 18px;
             }
+            if App.state == 2: Text {
+                text: (App.cur-ip != "" ? "Выходной IP: " + App.cur-ip + " · " : "")
+                    + (App.strict-route ? "Защита от утечек: вкл" : "Защита от утечек: базовая");
+                color: Theme.faint;
+                font-size: 11.5px;
+                horizontal-alignment: center;
+                overflow: elide;
+            }
         }
-        Rectangle { vertical-stretch: 1; min-height: 4px; }
+        Rectangle { vertical-stretch: 1; min-height: 2px; }
         // traffic
         if App.state == 2: HorizontalLayout {
             spacing: 10px;
@@ -174,7 +182,7 @@ export component HomePage inherits Rectangle {
         }
         // current server
         Clickable {
-            height: 66px;
+            height: App.cur-relay != "" ? 76px : 66px;
             clicked => { App.page = 1; App.page-changed(1); }
             HorizontalLayout {
                 padding-left: 12px;
@@ -202,8 +210,33 @@ export component HomePage inherits Rectangle {
                         font-size: Theme.font-small;
                         overflow: elide;
                     }
+                    if App.cur-relay != "": Text {
+                        text: "Через входное звено: " + App.cur-relay;
+                        color: Theme.accent;
+                        font-size: 11px;
+                        overflow: elide;
+                    }
                 }
                 Icon { y: (parent.height - self.height) / 2; name: "chevron-right"; size: 18px; color: Theme.faint; }
+            }
+        }
+        // quick country & search row on Home
+        HorizontalLayout {
+            spacing: 8px;
+            Pill {
+                horizontal-stretch: 1;
+                icon: "globe";
+                text: "Страна: " + App.countries-text;
+                active: App.countries-any;
+                clicked => { App.open-dialog("countries"); }
+            }
+            Pill {
+                icon: App.scanning ? "x" : "radar";
+                text: App.scanning ? "Стоп" : "Найти";
+                active: App.scanning;
+                clicked => {
+                    if (App.scanning) { App.cancel-scan(); } else { App.scan(); }
+                }
             }
         }
         if App.state == 2 && App.standby != "": Text {

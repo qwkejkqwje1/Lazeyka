@@ -9,7 +9,7 @@ export component AddDialog inherits Modal {
     title: "Добавить сервер";
     close => { App.dialog = ""; }
     Text {
-        text: "Вставьте ссылку (vless://, vmess://, trojan://, ss://, hy2://, tuic://, wireguard://), адрес подписки или содержимое файла: WireGuard / AmneziaWG .conf, OpenVPN .ovpn, Clash YAML, vpn:// из Amnezia.";
+        text: "Вставьте ссылку (vless://, vmess://, trojan://, ss://, hy2://, tuic://, masque://, wireguard://), адрес подписки или содержимое файла: WireGuard / AmneziaWG .conf, OpenVPN .ovpn, Clash YAML, vpn:// из Amnezia.";
         color: Theme.dim;
         font-size: 12px;
         wrap: word-wrap;
@@ -62,14 +62,14 @@ component InfoLine inherits Rectangle {
         padding-top: 4px;
         padding-bottom: 4px;
         spacing: 12px;
-        Text { text: root.label; color: Theme.dim; font-size: 12.5px; width: 100px; }
+        Text { text: root.label; color: Theme.dim; font-size: 12.5px; width: 105px; }
         Text { text: root.value; color: root.tint; font-size: 12.5px; wrap: word-wrap; horizontal-stretch: 1; }
     }
 }
 
 export component ServerDialog inherits Modal {
     title: "Сервер";
-    max-h: 680px;
+    max-h: 720px;
     close => { App.dialog = ""; }
     property <ServerItem> s: App.detail;
     HorizontalLayout {
@@ -119,8 +119,19 @@ export component ServerDialog inherits Modal {
             padding-right: 12px;
             padding-top: 6px;
             padding-bottom: 6px;
+            InfoLine {
+                label: "Статус";
+                value: root.s.state-label != "" ? root.s.state-label : (root.s.ok ? "Проверен" : "Не проверен");
+                tint: root.s.ok ? Theme.accent : Theme.warn;
+            }
             InfoLine { label: "Протокол"; value: root.s.proto + (root.s.transport != "" ? " · " + root.s.transport : ""); }
+            InfoLine {
+                label: "Маршрут";
+                value: root.s.relay != "" ? "Через: " + root.s.relay : "Напрямую";
+                tint: root.s.relay != "" ? Theme.accent : Theme.text;
+            }
             if root.s.address != "": InfoLine { label: "Адрес"; value: root.s.address; }
+            if root.s.exit-ip != "": InfoLine { label: "Выходной IP"; value: root.s.exit-ip; }
             InfoLine {
                 label: "Пинг";
                 value: root.s.ok ? root.s.latency + " мс" : root.s.tested ? "нет связи" : "не проверен";
@@ -132,12 +143,14 @@ export component ServerDialog inherits Modal {
                 value: root.s.stability != "" ? root.s.stability + " · " + root.s.checks : root.s.checks != "" ? "мало данных · " + root.s.checks : "мало данных";
                 tint: root.s.stability != "" ? Theme.text : Theme.faint;
             }
+            if root.s.trust-label != "": InfoLine { label: "Доверие"; value: root.s.trust-label; }
+            if root.s.limits-note != "": InfoLine { label: "Лимиты"; value: root.s.limits-note; tint: Theme.warn; }
             Rectangle {
                 HorizontalLayout {
                     padding-top: 4px;
                     padding-bottom: 4px;
                     spacing: 12px;
-                    Text { text: "Сервисы"; color: Theme.dim; font-size: 12.5px; width: 100px; }
+                    Text { text: "Сервисы"; color: Theme.dim; font-size: 12.5px; width: 105px; }
                     HorizontalLayout {
                         spacing: 5px;
                         alignment: start;
@@ -156,6 +169,12 @@ export component ServerDialog inherits Modal {
             if root.s.checked != "": InfoLine { label: "Проверен"; value: root.s.checked; }
             if root.s.error != "" && !root.s.ok: InfoLine { label: "Ошибка"; value: root.s.error; tint: Theme.err; }
         }
+    }
+    if root.s.trust-warning != "": Text {
+        text: root.s.trust-warning;
+        color: Theme.faint;
+        font-size: 11px;
+        wrap: word-wrap;
     }
     if root.s.mine: VerticalLayout {
         spacing: 6px;
@@ -298,7 +317,7 @@ export component CountriesDialog inherits Modal {
     max-h: 680px;
     close => { App.dialog = ""; }
     Text {
-        text: "Автовыбор будет подключаться только к серверам выбранных стран (в том числе к избранным и вашим), а поиск проверит их в первую очередь. Если в этих странах не останется рабочих серверов, автовыбор временно возьмёт любой.";
+        text: "Автовыбор будет подключаться ТОЛЬКО к серверам выбранных стран (без скрытой подмены на другую страну), а поиск проверит их в первую очередь. Если в выбранной стране пока нет рабочих серверов, программа предупредит об этом и запустит поиск.";
         color: Theme.dim;
         font-size: 12px;
         wrap: word-wrap;
@@ -679,9 +698,6 @@ component TargetRow inherits Rectangle {
     }
 }
 
-// Direction of a route (new or existing): first the kind, then a country or a server.
-// Three separate modals instead of one dialog with step blocks: conditional blocks
-// made Slint undercount the panel height and clip the bottom note.
 export component TargetKindsDialog inherits Modal {
     property <bool> edit: App.target-for != "";
     property <bool> list-mode: App.target-for.starts-with("@list:");
@@ -748,7 +764,7 @@ export component TargetKindsDialog inherits Modal {
             clicked => { App.pick-target("block"); }
         }
         Text {
-            text: "Если серверы маршрута перестанут отвечать, трафик временно пойдёт через VPN. Правило HTTP в настройках может направить порт 80 напрямую.";
+            text: "Если серверы маршрута перестанут отвечать, трафик временно пойдёт через VPN. Нешифрованный HTTP (порт 80) защищён от перехвата на публичных узлах.";
             color: Theme.faint;
             font-size: 11.5px;
             wrap: word-wrap;
@@ -948,7 +964,6 @@ export component TargetChainDialog inherits Modal {
     }
 }
 
-// A row of the chains manager and the lists dialog: name, info, two actions.
 component ActionRow inherits Rectangle {
     in property <string> title;
     in property <string> info;
@@ -1504,7 +1519,6 @@ export component ListDeleteDialog inherits Modal {
         }
     }
 }
-
 
 export component PresetsDialog inherits Modal {
     title: "Каталог наборов";

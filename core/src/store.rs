@@ -1,9 +1,9 @@
 //! Persistent state: settings, known servers, WARP account, source statistics.
 
 use crate::model::{Origin, Server};
+use crate::routes::Routes;
 use crate::scan::SourceStat;
 use crate::sources::SourceDef;
-use crate::routes::Routes;
 use crate::split::Split;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet};
@@ -138,9 +138,14 @@ pub struct Settings {
     /// Test servers that do not answer directly through a working entry hop.
     #[serde(default = "t")]
     pub relay_scan: bool,
-    /// Send TCP port 80 via a trusted server or directly, never via public-list servers.
+    /// Protect TCP port 80 from public-list servers: route via a trusted server or block (REJECT)
+    /// unless `http_allow_direct` is explicitly enabled.
     #[serde(default = "t")]
     pub https_only_free: bool,
+    /// Allow unencrypted HTTP (TCP/80) to go directly outside the VPN when no trusted server
+    /// is available. Disabled by default to prevent ISP DPI/IP leaks.
+    #[serde(default)]
+    pub http_allow_direct: bool,
     /// Check for new versions of the program and mihomo; mihomo is installed by itself.
     #[serde(default = "t")]
     pub auto_update: bool,
@@ -206,6 +211,31 @@ pub fn save<T: Serialize>(p: &Path, v: &T) -> std::io::Result<()> {
     crate::mihomo::write_atomic(p, &data)
 }
 
+/// Loads a WARP account from disk, transparently decrypting protected private_key / token fields.
+pub fn load_warp(p: &Path) -> Option<crate::warp::Account> {
+    let bytes = std::fs::read(p).ok()?;
+    let mut acc: crate::warp::Account = serde_json::from_slice(&bytes).ok()?;
+    if let Some(pk) = crate::providers::unprotect_secret(&acc.private_key, p) {
+        acc.private_key = pk;
+    }
+    if !acc.token.is_empty() {
+        if let Some(tok) = crate::providers::unprotect_secret(&acc.token, p) {
+            acc.token = tok;
+        }
+    }
+    if acc.usable() { Some(acc) } else { None }
+}
+
+/// Saves a WARP account to disk with protected private_key and token fields.
+pub fn save_warp(p: &Path, acc: &crate::warp::Account) -> std::io::Result<()> {
+    let mut stored = acc.clone();
+    stored.private_key = crate::providers::protect_secret(&acc.private_key, p);
+    if !acc.token.is_empty() {
+        stored.token = crate::providers::protect_secret(&acc.token, p);
+    }
+    save(p, &stored)
+}
+
 pub type Stats = HashMap<String, SourceStat>;
 
 /// Ids of removed dead servers → when they were buried. Sources keep listing the same
@@ -230,15 +260,16 @@ pub const MAX_FREE: usize = 1500;
 /// Failed because the way to it is closed from here — the entry-hop scan may still revive it.
 fn unreachable_here(s: &Server) -> bool {
     !crate::scan::is_udp_proto(s)
-        && s.probe.as_ref().is_some_and(|p| !p.ok && p.error.as_deref().is_some_and(|e| e.starts_with("порт закрыт") || e.starts_with("не отвечает")))
+        && s.probe.as_ref().is_some_and(|p| !p.ok && p.error.as_deref().is_some_and(crate::scan::is_path_blocked_err))
 }
 
 /// Dead: failed at least three checks in a row and has not worked (directly or through
 /// a hop) for three days — two if it never worked since it was added. A server that
 /// is unreachable from here is first given a try through an entry hop (up to a week).
-/// Untested ones are only judged by age. Favourites, own servers and WARP are never dead.
+/// Untested ones are only judged by age. Favourites, own servers, disabled/auth-blocked
+/// servers and WARP are never dead.
 pub fn is_dead(s: &Server, now: u64) -> bool {
-    if s.origin != Origin::Free || s.fav {
+    if s.origin != Origin::Free || s.fav || s.disabled || s.auth_error {
         return false;
     }
     if s.probe.is_none() {
@@ -287,7 +318,7 @@ pub const TRIM_TTL: u64 = 2 * 86400;
 pub fn prune_ex(servers: &mut Vec<Server>, now: u64) -> Pruned {
     let mut out = Pruned::default();
     servers.retain(|s| {
-        if s.origin != Origin::Free || s.fav {
+        if s.origin != Origin::Free || s.fav || s.disabled || s.auth_error {
             return true;
         }
         let checked = s.probe.as_ref().map(|p| p.at).unwrap_or(s.added);
@@ -299,7 +330,7 @@ pub fn prune_ex(servers: &mut Vec<Server>, now: u64) -> Pruned {
         }
         keep
     });
-    let free = |s: &Server| s.origin == Origin::Free && !s.fav;
+    let free = |s: &Server| s.origin == Origin::Free && !s.fav && !s.disabled && !s.auth_error;
     let n = servers.iter().filter(|s| free(s)).count();
     if n > MAX_FREE {
         // rank for removal: failing (0) before untested (1); within a class the oldest success first
@@ -381,8 +412,10 @@ mod tests {
         let forgotten = free(0, 0, now - 30 * day, None);
         let mut fav = free(9, 0, now - 90 * day, Some(now - 1000));
         fav.fav = true;
+        let mut auth_blocked = free(9, 0, now - 90 * day, Some(now - 1000));
+        auth_blocked.auth_error = true;
         assert!(is_dead(&corpse, now) && is_dead(&never, now) && is_dead(&forgotten, now));
-        assert!(!is_dead(&flaky, now) && !is_dead(&newcomer, now) && !is_dead(&fav, now));
+        assert!(!is_dead(&flaky, now) && !is_dead(&newcomer, now) && !is_dead(&fav, now) && !is_dead(&auth_blocked, now));
         let mut all = vec![corpse, flaky, never, newcomer, forgotten, fav];
         for (i, x) in all.iter_mut().enumerate() {
             x.id = format!("s{i}");
@@ -418,6 +451,7 @@ mod tests {
         let mut good = free(0, now - 10, now - 50 * day, Some(now - 10));
         good.id = "good".into();
         good.probe.as_mut().unwrap().ok = true;
+        good.probe.as_mut().unwrap().exit_ip = Some("203.0.113.5".into());
         good.probe.as_mut().unwrap().latency = Some(100);
         all.push(good);
         let gone = prune(&mut all, now);
@@ -447,6 +481,7 @@ mod tests {
         let mut fresh = Settings::default();
         assert!(!fresh.migrate());
         assert_eq!(fresh.routes, Routes::default());
+        assert!(!fresh.http_allow_direct);
     }
 
     #[test]

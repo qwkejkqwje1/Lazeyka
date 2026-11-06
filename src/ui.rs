@@ -118,6 +118,7 @@ pub fn newer(a: &str, b: &str) -> bool {
 #[serde(default)]
 struct RouteJs {
     id: String,
+    priority: usize,
     name: String,
     enabled: bool,
     target: String,
@@ -226,8 +227,10 @@ fn route_summary(r: &RouteJs) -> String {
 
 fn route_item(r: &RouteJs, i: usize, n: usize) -> RouteItem {
     let (kind, cc) = route_kind(&r.target);
+    let prio = if r.priority > 0 { r.priority } else { i + 1 };
     RouteItem {
         id: ss(&r.id),
+        priority: prio as i32,
         name: ss(&r.name),
         enabled: r.enabled,
         target: ss(&r.target),
@@ -281,6 +284,12 @@ fn item(s: &ServerView, selected: Option<&str>) -> ServerItem {
             (h, p) => format!("{h}:{p}"),
         }),
         checked: ss(if s.at > 0 { fmt_date(s.at) } else { String::new() }),
+        relay: ss(&s.relay_name),
+        exit_ip: ss(&s.exit_ip),
+        state_label: ss(&s.state_label),
+        trust_label: ss(&s.trust_label),
+        trust_warning: ss(&s.trust_warning),
+        limits_note: ss(&s.limits_note),
     }
 }
 
@@ -308,12 +317,13 @@ fn countries_text(cc: &[String]) -> String {
 }
 
 /// Subtitle of "Автовыбор" (and whether it is a warning).
+/// Strict country rule: never claim "используем любые" when the user picked specific countries.
 pub fn auto_sub(cc: &[String], usable: bool) -> (String, bool) {
     let names = if cc.len() <= 2 { cc.iter().map(|c| country(c)).collect::<Vec<_>>().join(", ") } else { cc.join(", ") };
     match (cc.is_empty(), usable) {
         (true, _) => (AUTO_SUB.into(), false),
         (false, true) => (format!("Только {names}"), false),
-        (false, false) => (format!("Нет рабочих в {} — используем любые", cc.join(", ")), true),
+        (false, false) => (format!("В {} пока нет рабочих серверов — нажмите «Найти»", cc.join(", ")), true),
     }
 }
 
@@ -474,10 +484,6 @@ impl Ctl {
         match self.call(req).await {
             Ok(v) => Some(v),
             Err(e) => {
-                // A stale service answers new commands (chains, lists, the
-                // rest-traffic switch) with raw protocol errors such as
-                // "unknown variant". That is not a broken command, it is a
-                // service that predates it: say so in plain words instead.
                 let stale = self.sh.lock().unwrap().status.as_ref().filter(|st| newer(VERSION, &st.version)).map(|st| st.version.clone());
                 match stale {
                     Some(v) => self.toast(format!("Служба Лазейки устарела (версия {v}). Обновите её на вкладке «Главная» кнопкой «Обновить» — после этого команда заработает.")),
@@ -607,7 +613,7 @@ impl Ctl {
         };
         let timer = if state == 2 && st.since > 0 { fmt_duration(now.saturating_sub(st.since)) } else { String::new() };
         let standby = st.standby.as_ref().map(|s| s.name.clone()).unwrap_or_default();
-        let (cur_name, cur_cc, cur_detail, cur_warp) = match &st.server {
+        let (cur_name, cur_cc, cur_detail, cur_warp, cur_ip, cur_relay, cur_trust) = match &st.server {
             Some(s) => {
                 let mut parts: Vec<String> = Vec::new();
                 if st.auto {
@@ -621,7 +627,18 @@ impl Ctl {
                 if s.ok && s.latency > 0 {
                     parts.push(format!("{} мс", s.latency));
                 }
-                (s.name.clone(), s.cc.clone(), parts.join(" · "), s.origin == Origin::Warp)
+                if s.speed > 0 {
+                    parts.push(fmt_speed(s.speed));
+                }
+                (
+                    s.name.clone(),
+                    s.cc.clone(),
+                    parts.join(" · "),
+                    s.origin == Origin::Warp,
+                    s.exit_ip.clone(),
+                    s.relay_name.clone(),
+                    s.trust_label.clone(),
+                )
             }
             None => {
                 let detail = if st.good > 0 {
@@ -629,7 +646,7 @@ impl Ctl {
                 } else {
                     "Лучший из доступных серверов".into()
                 };
-                ("Автовыбор".into(), String::new(), detail, false)
+                ("Автовыбор".into(), String::new(), detail, false, String::new(), String::new(), String::new())
             }
         };
         let p = &st.scan;
@@ -668,6 +685,9 @@ impl Ctl {
             a.set_cur_cc(ss(cur_cc));
             a.set_cur_detail(ss(cur_detail));
             a.set_cur_warp(cur_warp);
+            a.set_cur_ip(ss(cur_ip));
+            a.set_cur_relay(ss(cur_relay));
+            a.set_cur_trust(ss(cur_trust));
             a.set_auto(auto);
             a.set_down(ss(down));
             a.set_up(ss(up));
@@ -898,7 +918,12 @@ impl Ctl {
         let Ok(v) = self.call(json!({ "cmd": "settings" })).await else { return };
         let b = |k: &str, d: bool| v.get(k).and_then(Value::as_bool).unwrap_or(d);
         let (cos, warp, strict, ipv6) = (b("connect_on_start", false), b("warp", true), b("strict_route", true), b("ipv6", true));
-        let (auto_update, relay_scan, https_only_free) = (b("auto_update", true), b("relay_scan", true), b("https_only_free", true));
+        let (auto_update, relay_scan, https_only_free, http_allow_direct) = (
+            b("auto_update", true),
+            b("relay_scan", true),
+            b("https_only_free", true),
+            b("http_allow_direct", false),
+        );
         let net_summary = v.get("net_summary").and_then(Value::as_str).unwrap_or("").to_string();
         let warp_note = v.get("warp_note").and_then(Value::as_str).unwrap_or("").to_string();
         let stack = v.get("stack").and_then(Value::as_str).and_then(|s| STACKS.iter().position(|x| *x == s)).unwrap_or(0) as i32;
@@ -928,6 +953,7 @@ impl Ctl {
             a.set_auto_update(auto_update);
             a.set_relay_scan(relay_scan);
             a.set_https_only_free(https_only_free);
+            a.set_http_allow_direct(http_allow_direct);
             a.set_stack(stack);
             a.set_autostart(autostart);
             a.set_sort(sort);
@@ -1027,7 +1053,6 @@ impl Ctl {
             match route {
                 Some((item, sites, apps)) => {
                     a.set_route(item);
-                    // While the folder editor is open, sites/apps show the folder's entries.
                     if !folder_open {
                         with_models(|m| {
                             sync(&m.sites, sites);
@@ -1085,6 +1110,9 @@ impl Ctl {
                     parts.push(s.proto.clone());
                     if s.ok && s.latency > 0 {
                         parts.push(format!("{} мс", s.latency));
+                    }
+                    if !s.relay_name.is_empty() {
+                        parts.push(format!("Через: {}", s.relay_name));
                     }
                     if !s.ok {
                         parts.push("не отвечает".into());
@@ -1259,7 +1287,6 @@ impl Ctl {
                     }
                 }
             } else if let Some(list_id) = for_id.strip_prefix("@list:") {
-                // a list's own direction; an empty code clears it
                 me.act(json!({ "cmd": "list_update", "id": list_id, "target": code })).await;
                 me.load_routes().await;
                 me.ui(|w| w.global::<App>().set_dialog(ss("list-edit")));
@@ -1879,7 +1906,6 @@ impl Ctl {
                     me.load_servers().await;
                     me.load_sources().await;
                     me.poke.notify_one();
-                    // the engine checks new servers in the background
                     for _ in 0..3 {
                         tokio::time::sleep(Duration::from_secs(6)).await;
                         me.load_servers().await;
@@ -1924,7 +1950,6 @@ impl Ctl {
             return;
         }
         let me = self.clone();
-        // several entries, a URL list or a program among sites: the smart parser takes it
         if value.contains(|c: char| c.is_whitespace() || c == ',' || c == ';') && !(kind == 1 && value.contains('\\')) {
             self.bulk_add(id, value);
             return;
@@ -1944,7 +1969,6 @@ impl Ctl {
         });
     }
 
-    /// Pasted text of any shape: sites and programs are recognised automatically.
     fn bulk_add(self: &Arc<Self>, id: String, text: String) {
         let me = self.clone();
         self.go(async move {
@@ -2100,8 +2124,6 @@ impl Ctl {
         });
     }
 
-    /// Downloads the new package through the service and starts its `lazeyka.exe`: a copy
-    /// from another folder replaces this window and updates the service by itself.
     fn install_program_update(self: &Arc<Self>) {
         let me = self.clone();
         self.go(async move {
@@ -2117,10 +2139,10 @@ impl Ctl {
             };
             let exe = std::path::PathBuf::from(v.get("exe").and_then(Value::as_str).unwrap_or(""));
             let want = v.get("sha256").and_then(Value::as_str).unwrap_or("").to_string();
-            // the file must still be what the service unpacked
             let ok = tokio::task::spawn_blocking({
                 let exe = exe.clone();
                 move || lazeyka_core::update::sha256_file(&exe).map(|h| h == want).unwrap_or(false)
+                    && lazeyka_core::update::verify_pe_amd64(&exe).is_ok()
             })
             .await
             .unwrap_or(false);
@@ -2429,8 +2451,6 @@ fn ipc_path() -> String {
     std::env::var("LAZEYKA_SOCK").unwrap_or_else(|_| ipc::DEFAULT_PATH.to_string())
 }
 
-/// True when this copy runs from somewhere else than the installed program
-/// (a newly downloaded version): it then replaces an already running UI.
 fn is_foreign_copy() -> bool {
     #[cfg(windows)]
     {
@@ -2459,10 +2479,6 @@ fn show_main_window() {
     }
 }
 
-/// Windows may throw away what was drawn into the window (restore from minimized, unlock,
-/// display changes) while the software renderer only repaints the parts that changed, which
-/// left "holes" showing whatever is behind the window. Repaint everything when the system asks
-/// for it, after a restore and on focus (so a click always fixes the picture).
 fn guard_repaint(w: &AppWindow) {
     use slint::winit_030::winit::event::WindowEvent;
     use slint::winit_030::{EventResult, WinitWindowAccessor};
@@ -2487,8 +2503,6 @@ fn guard_repaint(w: &AppWindow) {
     });
 }
 
-/// True when the window has an update region, i.e. the system (not the app) invalidated it.
-/// Redraws requested by the app itself come without one.
 fn os_invalidated(win: &slint::Window) -> bool {
     #[cfg(windows)]
     {
@@ -3049,6 +3063,8 @@ mod tests {
         assert!(newer("0.2.0", "0.1.9"));
         assert!(!newer("0.1.0", "0.1.0"));
         assert!(!newer("0.1.0", "0.10.0"));
+        let (sub, warn) = auto_sub(&["NL".to_string()], false);
+        assert!(warn && sub.contains("NL"));
     }
 
     #[test]

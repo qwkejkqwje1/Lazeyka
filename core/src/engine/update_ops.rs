@@ -120,13 +120,28 @@ impl Engine {
     }
 
     async fn update_mihomo_inner(&self, rel: &update::Release) -> Result<(), String> {
+        if rel.sha256.as_deref().is_none_or(|h| !update::valid_sha256(h)) {
+            return Err("обновление mihomo отклонено: отсутствует контрольная сумма SHA-256".into());
+        }
         let dir = self.paths.data.join("update");
         let _ = std::fs::remove_dir_all(&dir);
         let zip = dir.join("mihomo.zip");
         update::download(rel, &zip).await?;
-        let files = update::extract(&zip, &dir, &|n| n.starts_with("mihomo") && n.ends_with(".exe"))?;
+        let files = update::extract(&zip, &dir, &|n| {
+            let l = n.to_ascii_lowercase();
+            (l == "mihomo.exe" || l.starts_with("mihomo-windows-amd64")) && l.ends_with(".exe")
+        })?;
         let _ = std::fs::remove_file(&zip);
+        if files.len() != 1 {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err("в архиве mihomo должен быть ровно один исполняемый файл".into());
+        }
         let exe = files.into_iter().next().ok_or("в архиве нет mihomo")?;
+        // Verify PE x86_64 header before staging or executing
+        if let Err(e) = update::verify_pe_amd64(&exe) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
         let target = self.paths.mihomo();
         let staged = target.with_extension("exe.new");
         let _ = std::fs::remove_file(&staged);
@@ -136,10 +151,12 @@ impl Engine {
             Some(v) if v == rel.version => {}
             Some(v) => {
                 let _ = std::fs::remove_file(&staged);
+                let _ = std::fs::remove_dir_all(&dir);
                 return Err(format!("в архиве версия {v}, а не {}", rel.version));
             }
             None => {
                 let _ = std::fs::remove_file(&staged);
+                let _ = std::fs::remove_dir_all(&dir);
                 return Err("новый mihomo не запускается — прежний оставлен".into());
             }
         }
@@ -173,6 +190,9 @@ impl Engine {
     /// SHA-256 of its `lazeyka.exe`: the UI checks it right before starting the installer.
     pub(super) async fn update_program(self: &Arc<Self>) -> Result<Value, String> {
         let rel = self.st.lock().unwrap().update.program.clone().ok_or("новой версии нет")?;
+        if rel.sha256.as_deref().is_none_or(|h| !update::valid_sha256(h)) {
+            return Err("обновление отклонено: в релизе отсутствует контрольная сумма SHA-256".into());
+        }
         if std::mem::replace(&mut self.st.lock().unwrap().update.busy, true) {
             return Err("обновление уже идёт".into());
         }
@@ -184,6 +204,7 @@ impl Engine {
             let files = update::extract(&zip, &dir, &is_package_file)?;
             let _ = std::fs::remove_file(&zip);
             let exe = files.into_iter().find(|p| p.file_name().is_some_and(|n| n == "lazeyka.exe")).ok_or("в архиве нет lazeyka.exe")?;
+            update::verify_pe_amd64(&exe)?;
             let sum = update::sha256_file(&exe).map_err(|e| e.to_string())?;
             Ok((exe, sum))
         }

@@ -108,7 +108,7 @@ pub fn proto_rank(s: &Server) -> u8 {
         Proto::Vless if reality => 0,
         // in 2026 Russia, XHTTP and gRPC outlive plain TCP the longest
         Proto::Vless if tls && (net == "xhttp" || net == "grpc") => 1,
-        Proto::Hysteria2 | Proto::Anytls | Proto::Tuic | Proto::Awg => 1,
+        Proto::Hysteria2 | Proto::Anytls | Proto::Tuic | Proto::Awg | Proto::Masque => 1,
         Proto::Trojan => 2,
         Proto::Vless if tls => 2,
         Proto::Vmess if tls => 3,
@@ -138,7 +138,10 @@ pub const RELAY_TIER: i64 = 100_000;
 
 /// Ranking score for AUTO order; lower is better. Non-working servers get i64::MAX.
 pub fn score(s: &Server) -> i64 {
-    let Some(p) = s.probe.as_ref().filter(|p| p.ok) else { return i64::MAX };
+    if s.disabled || s.auth_error {
+        return i64::MAX;
+    }
+    let Some(p) = s.probe.as_ref().filter(|p| p.ok && p.exit_ip.is_some()) else { return i64::MAX };
     let mut sc = p.latency.unwrap_or(1500).min(5000) as i64;
     if p.udp == Some(false) {
         sc += 250;
@@ -200,6 +203,21 @@ pub fn cooldown(s: &Server) -> u64 {
     }
     let c = ((20u64 * 60) << (s.fails - 2).min(5)).min(6 * 3600);
     if s.oks > 0 { c / 2 } else { c }
+}
+
+/// Cooldown with deterministic jitter (0..15%) derived from server id and failure count
+/// so batches of failed servers do not synchronize their re-tests.
+pub fn cooldown_with_jitter(s: &Server) -> u64 {
+    let base = cooldown(s);
+    if base == 0 {
+        return 0;
+    }
+    let mut h: u64 = s.fails as u64;
+    for b in s.id.as_bytes() {
+        h = h.wrapping_mul(131).wrapping_add(*b as u64);
+    }
+    let jitter = (base * (h % 16)) / 100;
+    base + jitter
 }
 
 /// What the database has learned about where working servers live: per /24 (IPv6: /48)
@@ -303,11 +321,11 @@ pub fn plan(
 ) -> Vec<Server> {
     let mut by_src: HashMap<&str, Vec<&Server>> = HashMap::new();
     for s in all {
-        if s.origin != Origin::Free || insecure(s) {
+        if s.origin != Origin::Free || s.disabled || s.auth_error || s.circuit_open(now) || insecure(s) {
             continue;
         }
         let recent = s.probe.as_ref().map(|p| now.saturating_sub(p.at)).unwrap_or(u64::MAX);
-        if recent < cooldown(s) {
+        if recent < cooldown_with_jitter(s) {
             continue;
         }
         by_src.entry(s.source.as_str()).or_default().push(s);
@@ -324,11 +342,6 @@ pub fn plan(
     let mut later: Vec<(u8, std::collections::VecDeque<&Server>)> = Vec::new();
     for d in &srcs {
         let mut v = by_src.remove(d.id.as_str()).unwrap_or_default();
-        // previously good first, then protocol rank, then shuffle-ish by id
-        // previously good first; then servers that appeared in the last day (fresh entries
-        // of a list live longest and have not been blocked yet); then DPI resistance
-        // then servers next to working ones (same network or camouflage name), unknown
-        // neighbourhoods, and last those where everything around is dead
         v.sort_by_key(|s| {
             let fresh = now.saturating_sub(s.added) < 24 * 3600;
             (if s.good() { 0 } else { 1 }, hints.class(s), if fresh { 0 } else { 1 }, proto_rank(s), s.fails, std::cmp::Reverse(s.added), s.id.clone())
@@ -404,15 +417,27 @@ pub fn relay_hops(all: &[Server], n: usize, avoid: &HashSet<String>) -> Vec<Serv
     v.into_iter().filter(|s| hosts.insert(s.host.clone())).take(n).cloned().collect()
 }
 
+/// True if the probe error indicates a direct path block (port closed, timeout, DPI reset,
+/// EOF, or 16 KB TSPU cut) that an entry hop may bypass.
+pub fn is_path_blocked_err(e: &str) -> bool {
+    e.starts_with("порт закрыт")
+        || e.starts_with("не отвечает")
+        || e.starts_with("таймаут")
+        || e.starts_with("соединение сброшено")
+        || e.starts_with("соединение закрыто")
+        || e.starts_with("нет соединения")
+        || e == probe::CUT_ERR
+}
+
 /// Servers worth a second look through a hop: TCP-based, failed from here because the
-/// way to them is closed (port closed / no answer), not tried through a hop lately.
+/// direct path is blocked (port closed, no answer, DPI reset, timeout, or 16 KB cut),
+/// not tried through a hop lately.
 pub fn relay_candidates(all: &[Server], now: u64, limit: usize, retry_after: u64) -> Vec<Server> {
-    let unreachable = |e: &str| e.starts_with("порт закрыт") || e.starts_with("не отвечает");
     let mut v: Vec<&Server> = all
         .iter()
-        .filter(|s| s.origin != Origin::Warp && s.relay.is_none() && !insecure(s) && !is_udp_proto(s))
+        .filter(|s| s.origin != Origin::Warp && !s.disabled && !s.auth_error && s.relay.is_none() && !insecure(s) && !is_udp_proto(s))
         .filter(|s| now.saturating_sub(s.relay_at) >= retry_after)
-        .filter(|s| s.probe.as_ref().is_some_and(|p| !p.ok && p.error.as_deref().is_some_and(unreachable)))
+        .filter(|s| s.probe.as_ref().is_some_and(|p| !p.ok && p.error.as_deref().is_some_and(is_path_blocked_err)))
         .collect();
     v.sort_by_key(|s| {
         let fresh = now.saturating_sub(s.added) < 24 * 3600;
@@ -423,8 +448,8 @@ pub fn relay_candidates(all: &[Server], now: u64, limit: usize, retry_after: u64
 
 /// Tests servers through working entry hops. In one lab: the hops themselves and, for
 /// every candidate, a copy that dials through its hop (the one in `relay` when it is
-/// among `hops`, else round-robin). Successes come back with `relay` set and a fresh
-/// probe; failures only get `relay_at` (their direct failure was already counted).
+/// among `hops`, else round-robin). Warms up entry hops first and retries silent 2-hop
+/// nodes with `ALT_TEST_URL`.
 pub async fn check_relay(env: &Env, list: Vec<Server>, hops: Vec<Server>, o: &Opts, net: &mut NetInfo, mut on_batch: impl FnMut(&[Server])) -> Vec<Server> {
     let mut done: Vec<Server> = Vec::new();
     if hops.is_empty() || list.is_empty() {
@@ -473,7 +498,17 @@ pub async fn check_relay(env: &Env, list: Vec<Server>, hops: Vec<Server>, o: &Op
             }
         }
         let Some(mut lab) = lab else { break };
-        let alive = lab.proc.api.group_delay("ALL", mihomo::TEST_URL, o.delay_timeout_ms * 2).await;
+        // Warm up entry hops first so the first tunnel is open before 2-hop checks run
+        for h in &hops {
+            let _ = lab.proc.api.proxy_delay(&h.id, mihomo::TEST_URL, o.delay_timeout_ms).await;
+        }
+        let mut alive = lab.proc.api.group_delay("ALL", mihomo::TEST_URL, o.delay_timeout_ms * 2).await;
+        if alive.len() < variants.len() + nh {
+            let again = lab.proc.api.group_delay("ALL", mihomo::ALT_TEST_URL, o.delay_timeout_ms * 2).await;
+            for (k, v) in again {
+                alive.entry(k).or_insert(v);
+            }
+        }
         let sem = Arc::new(tokio::sync::Semaphore::new(o.parallel.max(1)));
         let mut js = tokio::task::JoinSet::new();
         let mut results: Vec<Option<(Probe, Option<probe::Trace>)>> = vec![None; batch.len()];
@@ -538,6 +573,72 @@ pub async fn check_relay(env: &Env, list: Vec<Server>, hops: Vec<Server>, o: &Op
     done
 }
 
+/// Registers a new Cloudflare WARP device through a working entry hop (`hop`) when direct
+/// access to `api.cloudflareclient.com` is blocked by the ISP.
+pub async fn register_warp_via_hop(env: &Env, hop: &Server) -> Result<crate::warp::Account, String> {
+    let mut lab = start_lab_in(env, &env.dir.join("warp-reg"), &[hop]).await?;
+    let _ = lab.proc.api.proxy_delay(&hop.id, mihomo::TEST_URL, 5000).await;
+    let l = &lab.nodes[0];
+    let res = match probe::client(Some((l.port, &l.user, &l.pass)), Duration::from_secs(20)) {
+        Ok(c) => crate::warp::register(&c).await,
+        Err(e) => Err(e),
+    };
+    lab.proc.stop().await;
+    res
+}
+
+/// Tests WARP variants sequentially through a working entry hop (`VPN → WARP`) when direct
+/// access to Cloudflare is blocked by the ISP.
+pub async fn check_warp_via_hop(env: &Env, warp_list: Vec<Server>, hop: &Server, o: &Opts, net: &mut NetInfo) -> Vec<Server> {
+    if warp_list.is_empty() {
+        return Vec::new();
+    }
+    env.stage("Проверка WARP через входное звено");
+    let mut variants: Vec<Server> = Vec::with_capacity(warp_list.len());
+    for s in &warp_list {
+        let mut v = s.clone();
+        v.id = format!("{}~w", s.id);
+        v.relay = None;
+        v.proxy.insert("dialer-proxy".into(), serde_json::Value::String(hop.id.clone()));
+        variants.push(v);
+    }
+    let mut refs: Vec<&Server> = vec![hop];
+    refs.extend(variants.iter());
+    let mut lab = match start_lab(env, &refs).await {
+        Ok(l) => l,
+        Err(e) => {
+            env.progress.lock().unwrap().error = Some(e);
+            return Vec::new();
+        }
+    };
+    let _ = lab.proc.api.proxy_delay(&hop.id, mihomo::TEST_URL, o.delay_timeout_ms).await;
+    let mut out = Vec::new();
+    let mut good = 0;
+    for (i, mut s) in warp_list.into_iter().enumerate() {
+        if env.cancelled() || good >= 1 {
+            break;
+        }
+        let vid = &variants[i].id;
+        let alive = lab.proc.api.proxy_delay(vid, mihomo::TEST_URL, o.delay_timeout_ms * 2).await;
+        let (p, t) = if alive.is_some() {
+            let l = &lab.nodes[1 + i];
+            let nc = probe::NodeCheck { port: l.port, user: l.user.clone(), pass: l.pass.clone(), udp: false, services: o.services, volume: o.volume };
+            probe::check_node(&nc).await
+        } else {
+            (Probe { at: util::now(), error: Some("не отвечает (через звено)".into()), ..Default::default() }, None)
+        };
+        finalize(&mut s, p, t, net, env.geo.as_deref());
+        if s.good() {
+            s.relay = Some(hop.id.clone());
+            s.relay_at = util::now();
+            good += 1;
+        }
+        out.push(s);
+    }
+    lab.proc.stop().await;
+    out
+}
+
 /// A relay server is only usable while the hop it dials through works.
 pub fn relay_ok(all: &[Server], s: &Server) -> bool {
     s.relay.as_ref().is_none_or(|r| all.iter().any(|h| &h.id == r && h.good() && h.relay.is_none()))
@@ -566,10 +667,14 @@ pub struct PoolOpts<'a> {
 /// Hot pool for AUTO; the order is the fallback priority: working favourites, working own
 /// servers, the best other servers (distinct hosts), a WARP spare, then own servers that are
 /// not checked yet and, as a last resort, own/favourite servers that failed their last check.
-/// With chosen countries only servers exiting there are used — unless none of them works.
+/// STRICT COUNTRY RULE: When `o.countries` is non-empty, ONLY servers exiting in `o.countries`
+/// (plus an explicit manual `selected` server) are included — never silently substitute a
+/// different country.
 pub fn pool(all: &[Server], o: &PoolOpts) -> Vec<Server> {
-    let restrict = !o.countries.is_empty() && countries_usable(all, o.countries);
+    let now = util::now();
+    let restrict = !o.countries.is_empty();
     let cc_ok = |s: &Server| !restrict || in_countries(s, o.countries);
+    let usable = |s: &Server| s.good() && !s.circuit_open(now);
     let sorted = |f: &dyn Fn(&Server) -> bool| {
         let mut v: Vec<&Server> = all.iter().filter(|s| f(s)).collect();
         v.sort_by_key(|s| score(s));
@@ -581,15 +686,15 @@ pub fn pool(all: &[Server], o: &PoolOpts) -> Vec<Server> {
             out.push(s.clone());
         }
     };
-    for s in sorted(&|s| s.fav && s.good() && cc_ok(s)) {
+    for s in sorted(&|s| s.fav && usable(s) && cc_ok(s)) {
         push(s, &mut out);
     }
-    for s in sorted(&|s| !s.fav && s.origin == Origin::Mine && s.good() && cc_ok(s)) {
+    for s in sorted(&|s| !s.fav && s.origin == Origin::Mine && usable(s) && cc_ok(s)) {
         push(s, &mut out);
     }
     let mut hosts: HashSet<String> = out.iter().map(|s| s.host.clone()).collect();
     let mut n = 0;
-    for s in sorted(&|s| !s.fav && s.origin == Origin::Free && s.good() && cc_ok(s)) {
+    for s in sorted(&|s| !s.fav && s.origin == Origin::Free && usable(s) && cc_ok(s)) {
         if n >= o.size {
             break;
         }
@@ -599,22 +704,25 @@ pub fn pool(all: &[Server], o: &PoolOpts) -> Vec<Server> {
         }
     }
     if o.warp && !out.iter().any(|s| s.origin == Origin::Warp) {
-        if let Some(w) = sorted(&|s| s.origin == Origin::Warp && s.good() && cc_ok(s)).first() {
+        if let Some(w) = sorted(&|s| s.origin == Origin::Warp && usable(s) && cc_ok(s)).first() {
             push(w, &mut out);
         }
     }
     if !restrict {
-        for s in all.iter().filter(|s| s.origin == Origin::Mine && s.probe.is_none()) {
+        for s in all.iter().filter(|s| s.origin == Origin::Mine && !s.disabled && !s.auth_error && s.probe.is_none()) {
             push(s, &mut out);
         }
-        let mut dead: Vec<&Server> = all.iter().filter(|s| (s.origin == Origin::Mine || s.fav) && s.probe.as_ref().is_some_and(|p| !p.ok)).collect();
+        let mut dead: Vec<&Server> = all
+            .iter()
+            .filter(|s| (s.origin == Origin::Mine || s.fav) && !s.disabled && !s.auth_error && !s.circuit_open(now) && s.probe.as_ref().is_some_and(|p| !p.ok))
+            .collect();
         dead.sort_by_key(|s| std::cmp::Reverse(s.last_ok));
         for s in dead {
             push(s, &mut out);
         }
     }
     if let Some(sel) = o.selected {
-        if let Some(s) = all.iter().find(|s| s.id == sel) {
+        if let Some(s) = all.iter().find(|s| s.id == sel && !s.disabled) {
             push(s, &mut out);
         }
     }
@@ -687,9 +795,13 @@ async fn start_lab_in(env: &Env, dir: &std::path::Path, servers: &[&Server]) -> 
 /// Extracts the failing proxy index from a mihomo parse error ("proxy 12: ...").
 fn bad_proxy_index(err: &str) -> Option<usize> {
     let i = err.find("proxy ")?;
-    let rest = &err[i + 6..];
+    let rest = &rest_at(err, i + 6);
     let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     if rest[num.len()..].starts_with(':') { num.parse().ok() } else { None }
+}
+
+fn rest_at(s: &str, idx: usize) -> &str {
+    s.get(idx..).unwrap_or("")
 }
 
 /// Detects direct (real) IP and user country through the lab DIRECT listener.
@@ -728,19 +840,33 @@ fn test_local_exit(s: &Server) -> bool {
         && s.host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-fn finalize(s: &mut Server, p: Probe, trace: Option<probe::Trace>, net: &NetInfo, geo: Option<&Geo>) {
+pub fn finalize(s: &mut Server, p: Probe, trace: Option<probe::Trace>, net: &NetInfo, geo: Option<&Geo>) {
     finalize_with(s, p, trace, net, geo, true)
 }
 
 /// `count` = false: the failure is not the server's fault (our network or lab was down),
 /// so neither its failure counter nor its stability history is touched.
-fn finalize_with(s: &mut Server, mut p: Probe, trace: Option<probe::Trace>, net: &NetInfo, geo: Option<&Geo>, count: bool) {
+/// Authentication failures (`is_auth_failure`) set `s.auth_error = true` without incrementing
+/// `s.fails` or marking the server dead.
+pub fn finalize_with(s: &mut Server, mut p: Probe, trace: Option<probe::Trace>, net: &NetInfo, geo: Option<&Geo>, count: bool) {
+    if let Some(err) = p.error.as_deref() {
+        if crate::model::is_auth_failure(err) {
+            p.ok = false;
+            s.auth_error = true;
+            s.probe = Some(p);
+            return;
+        }
+    }
     if let Some(ip) = p.exit_ip.as_deref().and_then(|x| x.parse::<IpAddr>().ok()) {
         p.exit_cc = geo.and_then(|g| g.country(ip)).or_else(|| trace.as_ref().and_then(|t| t.loc.clone()));
         if p.ok && net.direct_ip == Some(ip) && !test_local_exit(s) {
             p.ok = false;
             p.error = Some("трафик идёт напрямую".into());
         }
+    } else if p.ok {
+        // Never mark a node working without a verified exit IP
+        p.ok = false;
+        p.error = Some("нет подтверждённого выходного IP".into());
     }
     if p.ok && s.origin == Origin::Free {
         if let (Some(cc), Some(ucc)) = (&p.exit_cc, &net.user_cc) {
@@ -754,8 +880,13 @@ fn finalize_with(s: &mut Server, mut p: Probe, trace: Option<probe::Trace>, net:
         s.oks = s.oks.saturating_add(1);
         s.fails = 0;
         s.last_ok = p.at;
+        s.auth_error = false;
+        s.cb_until = 0;
     } else if count {
         s.fails = s.fails.saturating_add(1);
+        if s.fails >= 2 {
+            s.trip_circuit(p.at);
+        }
     }
     if count || p.ok {
         s.record(p.ok);
@@ -774,7 +905,7 @@ fn finalize_with(s: &mut Server, mut p: Probe, trace: Option<probe::Trace>, net:
 }
 
 pub(crate) fn is_udp_proto(s: &Server) -> bool {
-    matches!(s.proto, Proto::Hysteria2 | Proto::Tuic | Proto::Wireguard | Proto::Awg)
+    matches!(s.proto, Proto::Hysteria2 | Proto::Tuic | Proto::Wireguard | Proto::Awg | Proto::Masque)
         || s.proxy.get("network").and_then(|v| v.as_str()).is_some_and(|n| n == "quic" || n == "kcp")
 }
 
@@ -894,9 +1025,6 @@ pub async fn check(env: &Env, list: Vec<Server>, o: &Opts, net: &mut NetInfo, mu
         // Suspiciously few answers: the test URL may be blocked or the machine overloaded.
         // Second chance through another URL and a longer timeout before anyone is blamed.
         let mut env_down = false;
-        // Free servers are often slow to the first byte (an overloaded box, a long path):
-        // everyone who stayed silent gets a second try with another URL and a longer
-        // timeout. One extra round per batch finds noticeably more servers.
         if alive.len() < batch.len() {
             env.stage("Повторная проверка");
             let again = lab.proc.api.group_delay("ALL", mihomo::ALT_TEST_URL, o.delay_timeout_ms * 2).await;
@@ -1064,7 +1192,16 @@ mod tests {
             serde_json::from_str(&format!(r#"{{"type":"trojan","server":"{host}","port":443,"password":"x"}}"#)).unwrap();
         let mut s = Server::new(host, p, origin, "t").unwrap();
         if let Some((lat, cc)) = ok {
-            s.probe = Some(Probe { at: 1, ok: lat > 0, latency: Some(lat), exit_cc: Some(cc.into()), services: 7, udp: Some(true), ..Default::default() });
+            s.probe = Some(Probe {
+                at: 1,
+                ok: lat > 0,
+                latency: Some(lat),
+                exit_ip: if lat > 0 { Some("203.0.113.10".into()) } else { None },
+                exit_cc: Some(cc.into()),
+                services: 7,
+                udp: Some(true),
+                ..Default::default()
+            });
         }
         s
     }
@@ -1081,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_order() {
+    fn pool_order_and_strict_country_selection() {
         let fast = srv("fast", Origin::Free, Some((50, "NL")));
         let slow = srv("slow", Origin::Free, Some((400, "DE")));
         let mut fav = srv("fav", Origin::Free, Some((300, "FI")));
@@ -1099,17 +1236,19 @@ mod tests {
         let nl: HashSet<String> = ["NL".to_string()].into();
         let p = pool(&all, &PoolOpts { size: 8, countries: &nl, warp: true, selected: Some(&slow.id) });
         assert_eq!(ids(p), ["fast", "slow"]);
-        // a country without working servers is ignored
+        // STRICT COUNTRY RULE: a country without working servers returns an empty pool instead of silently connecting to another country!
         let jp: HashSet<String> = ["JP".to_string()].into();
         assert!(!countries_usable(&all, &jp));
         let p = pool(&all, &PoolOpts { size: 1, countries: &jp, warp: true, selected: None });
-        assert_eq!(ids(p), ["fav", "mine-ok", "fast", "mine-new", "mine-dead"]);
+        assert!(p.is_empty(), "strict country selection must not substitute servers from other countries");
     }
 
     #[test]
-    fn relay_selection() {
+    fn relay_selection_includes_dpi_errors() {
         let mut dead = srv("9.9.9.9", Origin::Free, Some((0, "NL")));
         dead.probe.as_mut().unwrap().error = Some("порт закрыт (TCP)".into());
+        let mut cut = srv("6.6.6.6", Origin::Free, Some((0, "NL")));
+        cut.probe.as_mut().unwrap().error = Some(probe::CUT_ERR.into());
         let mut weird = srv("8.8.8.8", Origin::Free, Some((0, "NL")));
         weird.probe.as_mut().unwrap().error = Some("подмена содержимого".into());
         let mut tried = dead.clone();
@@ -1118,12 +1257,11 @@ mod tests {
         tried.relay_at = 1000;
         let good_a = srv("1.1.1.1", Origin::Free, Some((50, "DE")));
         let good_b = srv("1.1.1.1", Origin::Free, Some((60, "DE")));
-        let all = vec![dead.clone(), weird, tried, good_a.clone(), good_b];
+        let all = vec![dead.clone(), cut, weird, tried, good_a.clone(), good_b];
         let c = relay_candidates(&all, 1100, 10, 600);
-        assert_eq!(c.len(), 1);
-        assert_eq!(c[0].host, "9.9.9.9");
+        assert_eq!(c.len(), 2);
         // the "tried" one comes back after the pause
-        assert_eq!(relay_candidates(&all, 1700, 10, 600).len(), 2);
+        assert_eq!(relay_candidates(&all, 1700, 10, 600).len(), 3);
         // hops: good servers, one per host
         let none = HashSet::new();
         let h = relay_hops(&all, 3, &none);
@@ -1156,6 +1294,28 @@ mod tests {
         assert_eq!(h[0].host, "wg.example");
         let avoid: HashSet<String> = [wg.id.clone()].into_iter().collect();
         assert_eq!(relay_hops(&all2, 3, &avoid)[0].host, "1.1.1.1");
+    }
+
+    #[test]
+    fn finalize_preserves_auth_error_and_single_transient_failure_grace() {
+        let mut s = srv("1.2.3.4", Origin::Mine, Some((40, "NL")));
+        s.oks = 3;
+        let net = NetInfo { direct_ip: Some("198.51.100.1".parse().unwrap()), user_cc: Some("RU".into()), at: 100 };
+        // Auth failure does not increment fails or trip circuit breaker
+        finalize(&mut s, Probe { at: 200, ok: false, error: Some("HTTP 401 Unauthorized".into()), ..Default::default() }, None, &net, None);
+        assert!(s.auth_error);
+        assert_eq!(s.fails, 0);
+        assert!(!s.circuit_open(200));
+
+        // Transient single failure does not trip circuit breaker until 2nd consecutive failure
+        s.auth_error = false;
+        finalize(&mut s, Probe { at: 300, ok: false, error: Some("таймаут".into()), ..Default::default() }, None, &net, None);
+        assert_eq!(s.fails, 1);
+        assert!(!s.circuit_open(300));
+
+        finalize(&mut s, Probe { at: 400, ok: false, error: Some("таймаут".into()), ..Default::default() }, None, &net, None);
+        assert_eq!(s.fails, 2);
+        assert!(s.circuit_open(400));
     }
 
     #[test]
@@ -1211,9 +1371,9 @@ mod tests {
         let mut s = Server::new("wg", p, Origin::Free, "t").unwrap();
         let now = 2_000_000;
         assert!(bg_recheck(&s, now)); // never tested: the first check is fine
-        s.probe = Some(Probe { at: now - 3600, ok: true, ..Default::default() });
+        s.probe = Some(Probe { at: now - 3600, ok: true, exit_ip: Some("203.0.113.1".into()), ..Default::default() });
         assert!(!bg_recheck(&s, now)); // an hour ago: the background leaves it alone
-        s.probe = Some(Probe { at: now - 25 * 3600, ok: true, ..Default::default() });
+        s.probe = Some(Probe { at: now - 25 * 3600, ok: true, exit_ip: Some("203.0.113.1".into()), ..Default::default() });
         assert!(bg_recheck(&s, now)); // a day ago: one refresh is allowed
         let t = srv("plain", Origin::Free, Some((10, "US")));
         assert!(bg_recheck(&t, now)); // other protocols re-test freely
@@ -1227,6 +1387,7 @@ mod tests {
         assert_eq!(cooldown(&s), 0);
         s.fails = 2;
         assert_eq!(cooldown(&s), 20 * 60);
+        assert!(cooldown_with_jitter(&s) >= 20 * 60);
         s.fails = 3;
         assert_eq!(cooldown(&s), 40 * 60);
         s.fails = 100;

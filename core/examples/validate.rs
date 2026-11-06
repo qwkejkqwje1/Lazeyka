@@ -1,5 +1,5 @@
 //! Dev tool: parse sample lists, build lab + main configs and validate them with `mihomo -t`.
-use lazeyka_core::mihomo::{RoutePlan, Via};
+use lazeyka_core::mihomo::{RoutePlan, Spare, Via};
 use lazeyka_core::{import, mihomo, model::*, split};
 use std::path::Path;
 
@@ -62,14 +62,21 @@ fn main() {
         secret: "y".into(),
         default_direct: false,
         default_chain: None,
+        http_policy: None,
         routes: vec![
-            RoutePlan { id: "aaaa1111".into(), via: Via::Direct },
-            RoutePlan { id: "bbbb2222".into(), via: Via::Servers(refs.iter().skip(10).take(3).map(|s| s.id.clone()).chain([refs[0].id.clone()]).collect()) },
-            RoutePlan { id: "cccc3333".into(), via: Via::Block },
-            RoutePlan { id: "dddd4444".into(), via: Via::Vpn },
-            RoutePlan { id: "ffff6666".into(), via: Via::Chain("eeee5555".into()) },
+            RoutePlan { id: "aaaa1111".into(), via: Via::Direct, spare: Spare::Vpn, strategy: Default::default() },
+            RoutePlan {
+                id: "bbbb2222".into(),
+                via: Via::Servers(refs.iter().skip(10).take(3).map(|s| s.id.clone()).chain([refs[0].id.clone()]).collect()),
+                spare: Spare::Vpn,
+                strategy: Default::default(),
+            },
+            RoutePlan { id: "cccc3333".into(), via: Via::Block, spare: Spare::Vpn, strategy: Default::default() },
+            RoutePlan { id: "dddd4444".into(), via: Via::Vpn, spare: Spare::Vpn, strategy: Default::default() },
+            RoutePlan { id: "ffff6666".into(), via: Via::Chain("eeee5555".into()), spare: Spare::Vpn, strategy: Default::default() },
         ],
         chains,
+        hops: vec![],
         stack: "gvisor".into(),
         strict_route: true,
         ipv6: true,

@@ -70,7 +70,16 @@ pub fn parse_trace(body: &str) -> Trace {
     t
 }
 
-/// Exit IP via Cloudflare trace (fallback: Amazon checkip). Returns (trace, rtt_ms of 2nd request).
+/// Independent plain-IP endpoints used when Cloudflare trace is blocked on the path.
+pub const FALLBACK_IP_URLS: &[&str] = &[
+    "https://checkip.amazonaws.com/",
+    "https://api.ipify.org",
+    "https://icanhazip.com",
+];
+
+/// Exit IP via Cloudflare trace (fallback: Amazon checkip, ipify, icanhazip).
+/// Requires at least one independent endpoint to return a valid IP; a single blocked
+/// endpoint never causes a false "internet down" verdict.
 pub async fn exit_ip(c: &reqwest::Client) -> Result<(Trace, Option<u32>), String> {
     let urls = ["https://www.cloudflare.com/cdn-cgi/trace", "https://1.1.1.1/cdn-cgi/trace"];
     let mut last_err = String::new();
@@ -98,19 +107,34 @@ pub async fn exit_ip(c: &reqwest::Client) -> Result<(Trace, Option<u32>), String
             Err(e) => last_err = short_err(&e),
         }
     }
-    // fallback
-    match c.get("https://checkip.amazonaws.com/").send().await {
-        Ok(r) if r.status().is_success() => {
-            let body = r.text().await.unwrap_or_default();
-            let ip: Option<IpAddr> = body.trim().parse().ok();
-            if ip.is_some() {
-                return Ok((Trace { ip, loc: None, warp: false }, None));
+    // Independent fallbacks when Cloudflare is blocked by ISP/TSPU or target hoster
+    for u in FALLBACK_IP_URLS {
+        match c.get(*u).send().await {
+            Ok(r) if r.status().is_success() => {
+                let body = r.text().await.unwrap_or_default();
+                let ip: Option<IpAddr> = body.trim().parse().ok();
+                if ip.is_some() {
+                    let t0 = Instant::now();
+                    let rtt = match c.get(*u).send().await {
+                        Ok(r2) if r2.status().is_success() => {
+                            let _ = r2.bytes().await;
+                            Some(t0.elapsed().as_millis().max(1) as u32)
+                        }
+                        _ => None,
+                    };
+                    return Ok((Trace { ip, loc: None, warp: false }, rtt));
+                }
+                last_err = "нет IP в ответе".into();
             }
-            Err("нет IP в ответе".into())
+            Ok(r) => last_err = format!("HTTP {}", r.status().as_u16()),
+            Err(e) => {
+                if last_err.is_empty() {
+                    last_err = short_err(&e);
+                }
+            }
         }
-        Ok(r) => Err(format!("HTTP {}", r.status().as_u16())),
-        Err(e) => Err(if last_err.is_empty() { short_err(&e) } else { last_err }),
     }
+    Err(if last_err.is_empty() { "нет соединения".into() } else { last_err })
 }
 
 pub fn short_err(e: &reqwest::Error) -> String {

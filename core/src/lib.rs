@@ -1,5 +1,5 @@
 //! Лазейка core: share-link parsing, mihomo configuration, server scanner,
-//! split tunneling rules, WARP, storage and the engine protocol.
+//! split tunneling rules, WARP, free provider adapters, storage and the engine protocol.
 
 pub mod countries;
 pub mod engine;
@@ -12,6 +12,7 @@ pub mod model;
 pub mod netif;
 pub mod nettest;
 pub mod probe;
+pub mod providers;
 pub mod routes;
 pub mod scan;
 pub mod smart;

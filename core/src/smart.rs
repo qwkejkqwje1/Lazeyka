@@ -348,6 +348,8 @@ pub fn entry_covers(outer: &str, inner: &str) -> bool {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
+    /// 1-based priority order among active routing rules.
+    pub priority: usize,
     pub unit_id: String,
     pub name: String,
     pub target: Target,
@@ -364,6 +366,7 @@ pub enum Subject {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Explain {
     pub subject: Subject,
+    pub port: Option<u16>,
     /// All routing units that match, in precedence order; the first one decides.
     pub hits: Vec<Hit>,
     pub default: Target,
@@ -378,9 +381,29 @@ impl Explain {
     }
 }
 
-/// Where would a site (URL, domain, IP) or a program go, and which rule decides?
+/// Extracts optional `:port` from a host/URL query before normalization.
+fn split_host_port(raw: &str) -> (&str, Option<u16>) {
+    let s = raw.trim();
+    if looks_like_app(s) {
+        return (s, None);
+    }
+    let no_scheme = s.split("://").nth(1).unwrap_or(s);
+    let authority = no_scheme.split(['/', '?', '#']).next().unwrap_or(no_scheme);
+    if let Some((h, p)) = authority.rsplit_once(':') {
+        if !h.contains(':') || h.starts_with('[') {
+            if let Ok(port) = p.parse::<u16>() {
+                if port > 0 {
+                    return (h, Some(port));
+                }
+            }
+        }
+    }
+    (s, None)
+}
+
+/// Where would a site (URL, domain, IP, host:port) or a program go, and which rule decides?
 pub fn explain(routes: &Routes, input: &str) -> Explain {
-    let t = input.trim();
+    let (t, port) = split_host_port(input);
     let subject = if t.is_empty() {
         Subject::Invalid
     } else if looks_like_app(t) {
@@ -389,7 +412,8 @@ pub fn explain(routes: &Routes, input: &str) -> Explain {
         normalize_site(t).map(|s| Subject::Site(s.trim_end_matches("/32").trim_end_matches("/128").to_string())).unwrap_or(Subject::Invalid)
     };
     let mut hits = Vec::new();
-    for u in routes.units() {
+    for (idx, u) in routes.units().into_iter().enumerate() {
+        let priority = idx + 1;
         match &subject {
             Subject::Site(h) => {
                 // the most specific entry of the unit is the one worth showing
@@ -399,18 +423,18 @@ pub fn explain(routes: &Routes, input: &str) -> Explain {
                     .filter(|e| entry_matches(e, h))
                     .max_by_key(|e| e.len());
                 if let Some(e) = best {
-                    hits.push(Hit { unit_id: u.id.clone(), name: u.name.clone(), target: u.target.clone(), entry: e });
+                    hits.push(Hit { priority, unit_id: u.id.clone(), name: u.name.clone(), target: u.target.clone(), entry: e });
                 }
             }
             Subject::App(a) => {
                 if let Some(e) = routes.eff_list(&u, true).into_iter().find(|e| e.eq_ignore_ascii_case(a)) {
-                    hits.push(Hit { unit_id: u.id.clone(), name: u.name.clone(), target: u.target.clone(), entry: e });
+                    hits.push(Hit { priority, unit_id: u.id.clone(), name: u.name.clone(), target: u.target.clone(), entry: e });
                 }
             }
             Subject::Invalid => {}
         }
     }
-    Explain { subject, hits, default: routes.default.clone() }
+    Explain { subject, port, hits, default: routes.default.clone() }
 }
 
 // --------------------------------------------------------------------- lint
@@ -453,16 +477,16 @@ pub fn lint(routes: &Routes) -> Vec<Issue> {
     for (j, b) in units.iter().enumerate() {
         for apps in [false, true] {
             for e in routes.eff_list(b, apps) {
-                for a in units.iter().take(j) {
+                for (i, a) in units.iter().take(j).enumerate() {
                     let hit = routes.eff_list(a, apps).into_iter().find(|x| if apps { x.eq_ignore_ascii_case(&e) } else { entry_covers(x, &e) });
                     if let Some(x) = hit {
                         if a.target == b.target {
                             break;
                         }
                         let text = if x == e {
-                            format!("«{e}» есть и в «{}», и в «{}» — сработает «{}»", a.name, b.name, a.name)
+                            format!("«{e}» есть и в «{}» (№ {}), и в «{}» (№ {}) — сработает «{}»", a.name, i + 1, b.name, j + 1, a.name)
                         } else {
-                            format!("«{e}» в «{}» никогда не сработает: его перекрывает «{x}» в «{}» (поднимите «{}» выше)", b.name, a.name, b.name)
+                            format!("«{e}» в «{}» (№ {}) никогда не сработает: его перекрывает «{x}» в «{}» (№ {}) — поднимите «{}» выше", b.name, j + 1, a.name, i + 1, b.name)
                         };
                         out.push(Issue { route: b.id.clone(), text });
                         break;
@@ -582,12 +606,15 @@ mod tests {
     }
 
     #[test]
-    fn explain_picks_first_and_lists_all() {
+    fn explain_picks_first_and_lists_all_with_priority_and_port() {
         let (r, a, _) = sample();
-        let e = explain(&r, "https://gemini.google.com/app");
+        let e = explain(&r, "https://gemini.google.com:443/app");
+        assert_eq!(e.port, Some(443));
         assert_eq!(e.winner().unwrap().unit_id, a);
+        assert_eq!(e.winner().unwrap().priority, 1);
         assert_eq!(e.target(), &Target::Country("US".into()));
         assert_eq!(e.hits.len(), 2);
+        assert_eq!(e.hits[1].priority, 2);
         let e = explain(&r, "mail.google.com");
         assert_eq!(e.target(), &Target::Vpn);
         assert_eq!(e.hits.len(), 1);

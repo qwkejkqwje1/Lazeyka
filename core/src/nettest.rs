@@ -69,6 +69,47 @@ impl NetProfile {
     pub fn volume(&self) -> bool {
         !self.valid() || self.cut != Some(false)
     }
+
+    /// Recommended transport strategy based on detected network restrictions.
+    pub fn recommended_transport(&self) -> (&'static str, &'static str) {
+        if !self.valid() {
+            return ("Проверка не завершена", "Проверьте физическое подключение к интернету.");
+        }
+        if self.whitelist {
+            return (
+                "Белые списки (SNI-маскировка) + цепочка «VPN → VPN»",
+                "В вашей сети работают только разрешённые российские адреса. Лазейка ставит на первое место серверы из «белых» списков и двухзвенные цепочки через доступный входной узел.",
+            );
+        }
+        if self.cut == Some(true) && self.udp == Some(false) {
+            return (
+                "VLESS Reality / XHTTP / gRPC + цепочка «VPN → VPN»",
+                "Провайдер режет UDP и обрывает прямые TCP-соединения к зарубежным хостингам после ~16 КБ. Используются TCP-протоколы с маскировкой (Reality, XHTTP, gRPC) и обход через входное звено.",
+            );
+        }
+        if self.cut == Some(true) {
+            return (
+                "VLESS Reality / Hysteria2 / AmneziaWG (с проверкой 160 КБ)",
+                "Обнаружен обрыв потоков после ~16 КБ (ТСПУ) на зарубежных хостингах. Каждый сервер проверяется скачиванием 160 КБ; недоступные напрямую узлы проверяются через входное звено.",
+            );
+        }
+        if self.udp == Some(false) && self.cloudflare == Some(false) {
+            return (
+                "VLESS Reality / XHTTP / Trojan + «VPN → WARP»",
+                "UDP за рубеж и прямой доступ к Cloudflare заблокированы. Используются TCP-протоколы (VLESS Reality, XHTTP, Trojan); WARP подключается вторым звеном поверх рабочего VPN.",
+            );
+        }
+        if self.udp == Some(false) {
+            return (
+                "VLESS Reality / XHTTP / gRPC / Trojan (TCP)",
+                "UDP за рубеж блокируется. Прямой поиск отдаёт приоритет TCP-протоколам с маскировкой TLS/Reality.",
+            );
+        }
+        (
+            "Все протоколы (VLESS Reality, Hysteria2, AmneziaWG, WARP)",
+            "Существенных блокировок транспорта на канале не обнаружено — доступны как быстрые UDP-протоколы, так и VLESS Reality.",
+        )
+    }
 }
 
 /// Network key from the direct public IP and the country.
@@ -400,51 +441,59 @@ pub fn lines(p: &NetProfile) -> Vec<(String, String, i8, String)> {
         None => 0,
     };
     out.push((
-        "Зарубежные сайты".into(),
+        "TCP/443 (Зарубежные сайты)".into(),
         format!("открылось {} из {}", p.foreign[0], p.foreign[1]),
         if p.foreign[0] == 0 { -1 } else { 1 },
         if p.whitelist {
-            "Похоже на режим белых списков: открываются только разрешённые сайты. Серверы из «белых» списков проверяются первыми.".into()
+            "Похоже на режим белых списков: открываются только разрешённые российские сайты. Серверы из «белых» списков проверяются первыми.".into()
         } else {
             String::new()
         },
     ));
     out.push((
-        "Cloudflare".into(),
-        match p.cloudflare {
-            Some(true) => "доступен".into(),
-            Some(false) => "недоступен".into(),
-            None => "не проверен".into(),
-        },
-        tri(p.cloudflare),
-        if p.cloudflare == Some(false) {
-            "Cloudflare не ответил на проверку, поэтому прямую проверку WARP Лазейка временно пропускает. Серверы с адресами Cloudflare пропускаются. Попробуйте WARP через VPN: цепочка «VPN → WARP».".into()
-        } else {
-            String::new()
-        },
-    ));
-    out.push((
-        "UDP".into(),
+        "UDP/443 (QUIC / Hysteria2 / WG)".into(),
         match p.udp {
             Some(true) => "проходит".into(),
             Some(false) => "за рубеж не проходит".into(),
             None => "не проверен".into(),
         },
         tri(p.udp),
-        if p.udp == Some(false) { "Прямой поиск временно пропускает Hysteria2, TUIC и WireGuard из бесплатных списков: проверенные UDP-направления не ответили. Другие адреса и порты могут работать.".into() } else { String::new() },
+        if p.udp == Some(false) {
+            "Прямой поиск временно пропускает Hysteria2, TUIC, MASQUE и WireGuard из публичных списков: зарубежные UDP-порты блокируются ТСПУ. Ваши собственные серверы и TCP-транспорты проверяются штатно.".into()
+        } else {
+            String::new()
+        },
     ));
     out.push((
-        "DNS".into(),
+        "Cloudflare (WARP / CDN)".into(),
+        match p.cloudflare {
+            Some(true) => "доступен".into(),
+            Some(false) => "недоступен напрямую".into(),
+            None => "не проверен".into(),
+        },
+        tri(p.cloudflare),
+        if p.cloudflare == Some(false) {
+            "Прямой доступ к адресам Cloudflare заблокирован провайдером. Лазейка пропускает прямую проверку Cloudflare-узлов и автоматически пробует подключить WARP вторым звеном через рабочий VPN («VPN → WARP»).".into()
+        } else {
+            String::new()
+        },
+    ));
+    out.push((
+        "DNS (порт 53)".into(),
         match p.dns_spoof {
             Some(true) => "подменяется".into(),
             Some(false) => "честный".into(),
             None => "не проверен".into(),
         },
         tri(p.dns_spoof.map(|s| !s)),
-        if p.dns_spoof == Some(true) { "Провайдер подменяет адреса заблокированных сайтов. Лазейка узнаёт адреса через зашифрованный DNS — на её работу это не влияет.".into() } else { String::new() },
+        if p.dns_spoof == Some(true) {
+            "Провайдер подменяет ответы обычного DNS для заблокированных сайтов. Лазейка разрешает имена через зашифрованный DoH/DoT внутри туннеля — утечки и подмена исключены.".into()
+        } else {
+            String::new()
+        },
     ));
     out.push((
-        "Обрыв после 16 КБ".into(),
+        "Обрыв после 16 КБ (ТСПУ)".into(),
         match p.cut {
             Some(true) => format!("есть: {}", p.cut_hosts.join(", ")),
             Some(false) => "нет".into(),
@@ -452,10 +501,17 @@ pub fn lines(p: &NetProfile) -> Vec<(String, String, i8, String)> {
         },
         tri(p.cut.map(|c| !c)),
         if p.cut == Some(true) {
-            "Провайдер обрывает соединения с зарубежными хостингами после первых килобайт: сервер отвечает на проверку, но сайты через него не грузятся. Каждый найденный сервер теперь проверяется скачиванием 160 КБ — такие отсеиваются.".into()
+            "Провайдер обрывает соединения с зарубежными хостингами (Hetzner, OVH, Vultr, Cloudflare) после первых ~16 КБ. Каждый найденный сервер проверяется скачиванием 160 КБ, а заблокированные напрямую узлы проверяются через входное звено.".into()
         } else {
             String::new()
         },
+    ));
+    let (rec_title, rec_desc) = p.recommended_transport();
+    out.push((
+        "Рекомендуемый транспорт".into(),
+        rec_title.into(),
+        1,
+        rec_desc.into(),
     ));
     out
 }
@@ -516,6 +572,8 @@ mod tests {
         let dead = NetProfile::default();
         assert!(!dead.skip_udp() && !dead.cf_blocked() && dead.volume());
         assert_eq!(key_of(Some("95.24.1.2".parse().unwrap()), Some("RU")), "95.24.0.0/16|RU");
+        let rows = lines(&p);
+        assert!(rows.iter().any(|(k, _, _, _)| k == "Рекомендуемый транспорт"));
     }
 
     #[test]

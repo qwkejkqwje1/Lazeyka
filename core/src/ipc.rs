@@ -1,8 +1,8 @@
 //! Local IPC between the UI (user session) and the engine (service, LocalSystem).
 //!
 //! Transport: a Windows named pipe protected by an explicit DACL (SYSTEM and
-//! Administrators full access, interactive users read/write; remote clients rejected),
-//! or a Unix socket (mode 0600) for development on Linux.
+//! Administrators full access, active interactive console user read/write; remote
+//! clients rejected), or a Unix socket (mode 0600) for development on Linux.
 //! Protocol: one JSON object per line. Request `{"rid":N,"cmd":"…",…}` (`rid` so that it
 //! never clashes with command fields such as `id`), response `{"rid":N,"ok":true,"data":…}` or
 //! `{"rid":N,"ok":false,"error":"…"}`.
@@ -12,22 +12,46 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 
 #[cfg(windows)]
 pub const DEFAULT_PATH: &str = r"\\.\pipe\Lazeyka";
 #[cfg(not(windows))]
 pub const DEFAULT_PATH: &str = "/tmp/lazeyka.sock";
 
-/// Largest accepted message (imports of big subscription texts).
-pub const MAX_LINE: usize = 16 << 20;
+/// Largest accepted message (4 MiB — sufficient for large subscription imports while preventing memory abuse).
+pub const MAX_LINE: usize = 4 << 20;
 
-/// SDDL of the pipe: protected DACL; SYSTEM and Administrators — full access;
-/// interactive users — read/write (no WRITE_DAC/WRITE_OWNER, cannot create instances).
-#[cfg(windows)]
-pub const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
+/// Maximum concurrent requests processed on a single IPC connection.
+pub const MAX_CONCURRENT_REQS: usize = 16;
+
+/// Bounded response channel capacity per connection.
+pub const IPC_QUEUE_CAP: usize = 64;
+
+/// Maximum mutating commands per 5-second window per connection.
+pub const MAX_MUTATING_PER_WINDOW: u32 = 40;
+
+/// Default SDDL of the pipe when no specific interactive user SID is resolved:
+/// SYSTEM and Administrators — full access; Creator Owner + Interactive session — read/write.
+pub const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;CO)(A;;GRGW;;;IU)";
+
+/// Builds a pipe SDDL restricted to SYSTEM, Administrators, and a specific interactive user SID when known.
+pub fn build_pipe_sddl(user_sid: Option<&str>) -> String {
+    match user_sid.map(str::trim).filter(|s| s.starts_with("S-1-5-") && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')) {
+        Some(sid) => format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;{sid})"),
+        None => PIPE_SDDL.to_string(),
+    }
+}
+
+/// True when `cmd` only reads engine state without modifying configuration or connections.
+pub fn is_read_only_cmd(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "ping" | "status" | "servers" | "settings" | "routes" | "route_presets" | "route_explain" | "route_export" | "list_export" | "sources" | "logs"
+    )
+}
 
 pub const NOT_CONNECTED: &str = "нет связи со службой Лазейки";
 
@@ -40,29 +64,32 @@ async fn read_line_capped<R: AsyncRead + Unpin>(r: &mut BufReader<R>, buf: &mut 
             return Ok(if buf.is_empty() { None } else { Some(()) });
         }
         if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            if buf.len() + pos > MAX_LINE {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "message too large"));
+            }
             buf.extend_from_slice(&chunk[..pos]);
             r.consume(pos + 1);
             return Ok(Some(()));
         }
         let n = chunk.len();
-        buf.extend_from_slice(chunk);
-        r.consume(n);
-        if buf.len() > MAX_LINE {
+        if buf.len() + n > MAX_LINE {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "message too large"));
         }
+        buf.extend_from_slice(chunk);
+        r.consume(n);
     }
 }
 
 // ---------------------------------------------------------------- server
 
-/// Serves one client connection: requests are handled concurrently, responses are
-/// written as they complete (matched by id on the client side).
+/// Serves one client connection with bounded queues, concurrency cap, and rate limiting.
 pub async fn serve_conn<S>(stream: S, engine: Arc<Engine>)
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
     let (rd, mut wr) = tokio::io::split(stream);
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let (tx, mut rx) = mpsc::channel::<String>(IPC_QUEUE_CAP);
+    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_REQS));
     let writer = tokio::spawn(async move {
         while let Some(mut line) = rx.recv().await {
             line.push('\n');
@@ -74,23 +101,46 @@ where
     });
     let mut rd = BufReader::with_capacity(64 * 1024, rd);
     let mut buf = Vec::new();
+    let mut win_start = Instant::now();
+    let mut mutating_count: u32 = 0;
+
     while let Ok(Some(())) = read_line_capped(&mut rd, &mut buf).await {
         let v: Value = match serde_json::from_slice(&buf) {
             Ok(v) => v,
             Err(_) => continue,
         };
         let id = v.get("rid").cloned().unwrap_or(Value::Null);
+        let cmd = v.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
+        if !is_read_only_cmd(cmd) {
+            if win_start.elapsed() > Duration::from_secs(5) {
+                win_start = Instant::now();
+                mutating_count = 0;
+            }
+            mutating_count += 1;
+            if mutating_count > MAX_MUTATING_PER_WINDOW {
+                let err = json!({ "rid": id, "ok": false, "error": "слишком много команд подряд — подождите пару секунд" });
+                let _ = tx.try_send(err.to_string());
+                continue;
+            }
+        }
+        let Ok(permit) = sem.clone().try_acquire_owned() else {
+            let err = json!({ "rid": id, "ok": false, "error": "служба занята обработкой предыдущих запросов" });
+            let _ = tx.try_send(err.to_string());
+            continue;
+        };
         let tx = tx.clone();
         let engine = engine.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let resp = match serde_json::from_value::<Req>(v) {
-                Ok(req) => match engine.handle(req).await {
-                    Ok(data) => json!({ "rid": id, "ok": true, "data": data }),
-                    Err(e) => json!({ "rid": id, "ok": false, "error": e }),
+                Ok(req) => match tokio::time::timeout(Duration::from_secs(120), engine.handle(req)).await {
+                    Ok(Ok(data)) => json!({ "rid": id, "ok": true, "data": data }),
+                    Ok(Err(e)) => json!({ "rid": id, "ok": false, "error": e }),
+                    Err(_) => json!({ "rid": id, "ok": false, "error": "превышено время выполнения команды" }),
                 },
                 Err(e) => json!({ "rid": id, "ok": false, "error": format!("неизвестная команда: {e}") }),
             };
-            let _ = tx.send(resp.to_string());
+            let _ = tx.send(resp.to_string()).await;
         });
     }
     drop(tx);
@@ -151,7 +201,9 @@ pub use winsec::SecAttrs;
 #[cfg(windows)]
 pub async fn serve(engine: Arc<Engine>, path: &str) -> std::io::Result<()> {
     use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
-    let mut sa = SecAttrs::new(PIPE_SDDL)?;
+    let custom_sid = std::env::var("LAZEYKA_ALLOWED_SID").ok();
+    let sddl = build_pipe_sddl(custom_sid.as_deref());
+    let mut sa = SecAttrs::new(&sddl)?;
     let mut create = |first: bool| -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
         let mut o = ServerOptions::new();
         o.first_pipe_instance(first).reject_remote_clients(true).pipe_mode(PipeMode::Byte).in_buffer_size(64 * 1024).out_buffer_size(64 * 1024);
@@ -300,7 +352,6 @@ async fn run_client(path: String, mut rx: mpsc::UnboundedReceiver<Call>, connect
                     });
                 }
                 Err(_) => {
-                    connected.store(false, Ordering::Relaxed);
                     let _ = call.resp.send(Err(NOT_CONNECTED.into()));
                     continue;
                 }
@@ -308,20 +359,44 @@ async fn run_client(path: String, mut rx: mpsc::UnboundedReceiver<Call>, connect
         }
         let id = next.fetch_add(1, Ordering::Relaxed);
         let mut req = call.req;
-        if let Some(o) = req.as_object_mut() {
-            o.insert("rid".into(), Value::from(id));
+        if let Some(m) = req.as_object_mut() {
+            m.insert("rid".into(), id.into());
         }
         pending.lock().unwrap().insert(id, call.resp);
         let mut line = req.to_string();
         line.push('\n');
-        let w = writer.as_mut().unwrap();
-        if w.write_all(line.as_bytes()).await.is_err() || w.flush().await.is_err() {
-            writer = None;
+        let wr = writer.as_mut().unwrap();
+        if wr.write_all(line.as_bytes()).await.is_err() || wr.flush().await.is_err() {
             alive.store(false, Ordering::SeqCst);
             connected.store(false, Ordering::Relaxed);
+            writer = None;
             if let Some(tx) = pending.lock().unwrap().remove(&id) {
                 let _ = tx.send(Err(NOT_CONNECTED.into()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sddl_builder_restricts_sid() {
+        assert_eq!(
+            build_pipe_sddl(Some("S-1-5-21-100-200-300-1001")),
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;S-1-5-21-100-200-300-1001)"
+        );
+        // Invalid or injected SDDL falls back to safe default
+        assert_eq!(build_pipe_sddl(Some("invalid);(A;;GA;;;WD)")), PIPE_SDDL);
+        assert_eq!(build_pipe_sddl(None), PIPE_SDDL);
+    }
+
+    #[test]
+    fn command_classification() {
+        assert!(is_read_only_cmd("status"));
+        assert!(is_read_only_cmd("servers"));
+        assert!(!is_read_only_cmd("connect"));
+        assert!(!is_read_only_cmd("set_settings"));
     }
 }

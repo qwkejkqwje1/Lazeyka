@@ -52,7 +52,7 @@ component RouteCard inherits Clickable {
             alignment: center;
             horizontal-stretch: 1;
             Text {
-                text: root.item.name;
+                text: (root.item.priority > 0 ? "№ " + root.item.priority + " · " : "") + root.item.name;
                 color: root.item.enabled ? Theme.text : Theme.dim;
                 font-size: 13.5px;
                 font-weight: 600;
@@ -142,13 +142,13 @@ component RouteList inherits VerticalLayout {
             padding: 12px;
             spacing: 8px;
             Text {
-                text: "Сайт или программа: куда отправить?";
+                text: "Анализатор маршрута: куда пойдёт сайт или программа?";
                 color: Theme.text;
                 font-size: 13.5px;
                 font-weight: 600;
             }
             Field {
-                placeholder: "gemini.google.com или chrome.exe";
+                placeholder: "gemini.google.com, 8.8.8.8:443 или chrome.exe";
                 icon: "radar";
                 accepted(t) => { App.explain-route(t); }
             }
@@ -195,7 +195,7 @@ component RouteList inherits VerticalLayout {
         }
     }
     if App.routes.length > 0: SectionTitle {
-        text: "ВЕРХНИЕ МАРШРУТЫ ВАЖНЕЕ НИЖНИХ";
+        text: "ПРИОРИТЕТ ПРАВИЛ (№ 1 ПРОВЕРЯЕТСЯ ПЕРВЫМ)";
         x: 4px;
         overflow: elide;
     }
@@ -269,7 +269,7 @@ component RouteEditor inherits VerticalLayout {
             clicked => { App.route-open = false; }
         }
         Text {
-            text: App.route.name;
+            text: (App.route.priority > 0 ? "№ " + App.route.priority + " · " : "") + App.route.name;
             color: Theme.text;
             font-size: 18px;
             font-weight: 700;

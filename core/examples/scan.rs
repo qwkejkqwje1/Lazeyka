@@ -35,7 +35,8 @@ async fn main() {
     all.sort_by(|a, b| a.id.cmp(&b.id));
     all.dedup_by(|a, b| a.id == b.id);
     println!("unique {} in {:?}", all.len(), t0.elapsed());
-    let plan = scan::plan(&all, &cat, &HashMap::new(), limit, lazeyka_core::util::now(), &|_| true);
+    let hints = scan::Hints::default();
+    let plan = scan::plan(&all, &cat, &HashMap::new(), limit, lazeyka_core::util::now(), &|_| true, &hints);
     println!("planned {}", plan.len());
     let env = scan::Env {
         mihomo: a[1].clone().into(),

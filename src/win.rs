@@ -32,8 +32,8 @@ use windows::Win32::UI::Shell::{SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELL
 use windows::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO, MessageBoxW, SW_HIDE};
 use windows::core::{PCWSTR, w};
 use windows_service::service::{
-    ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
-    ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+    ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl, ServiceExitCode,
+    ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType, ServiceControl, ServiceControlAccept,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -113,7 +113,7 @@ fn command_exe(cmd: &str) -> PathBuf {
         return PathBuf::from(rest.split('"').next().unwrap_or(""));
     }
     match c.to_ascii_lowercase().find(".exe") {
-        Some(i) => PathBuf::from(&c[..i + 4]),
+        Some(i) => PathBuf::from(c.get(..i + 4).unwrap_or(c)),
         None => PathBuf::from(c.split(' ').next().unwrap_or("")),
     }
 }
@@ -223,8 +223,8 @@ pub fn assess(dir: &Path) -> Place {
         let mut fs = [0u16; 64];
         if unsafe { GetVolumeInformationW(PCWSTR(root.as_ptr()), None, None, None, Some(&mut flags), Some(&mut fs)) }.is_ok() && flags & FILE_PERSISTENT_ACLS == 0 {
             let n = fs.iter().position(|&c| c == 0).unwrap_or(fs.len());
-            risks.push(format!(
-                "Диск отформатирован в {} — без прав доступа к файлам: любая программа сможет подменить файлы службы.",
+            return blocked(format!(
+                "Диск отформатирован в {} — без поддержки прав доступа NTFS (ACL): служба SYSTEM не может безопасно работать на таком разделе. Перенесите папку Лазейки на раздел NTFS, {hint}.",
                 String::from_utf16_lossy(&fs[..n])
             ));
         }
@@ -646,7 +646,7 @@ fn install_inner() -> anyhow::Result<Vec<String>> {
         bail!("нужны права администратора");
     }
     enable_privileges();
-    let mut warn = Vec::new();
+    let warn = Vec::new();
     let src_exe = std::env::current_exe()?;
     let src_dir = src_exe.parent().map(Path::to_path_buf).context("папка программы")?;
     let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
@@ -696,8 +696,13 @@ fn install_inner() -> anyhow::Result<Vec<String>> {
     let data = home.join("data");
     std::fs::create_dir_all(&data).context("папка данных")?;
     migrate_legacy_data(&data);
+    // Security invariant: never register or start a LocalSystem service if the
+    // executable folder or data directory could not be locked down with ACLs.
     if let Err(e) = protect_home(&home, &data) {
-        warn.push(format!("Служба установлена, но папку программы не удалось закрыть от изменений ({e:#})."));
+        let _ = unprotect_home(&home);
+        bail!(
+            "Не удалось защитить папку программы правами администратора ({e:#}). Установка службы SYSTEM прервана для предотвращения подмены исполняемых файлов."
+        );
     }
     let info = ServiceInfo {
         name: SERVICE.into(),

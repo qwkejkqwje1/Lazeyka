@@ -5,6 +5,9 @@ use crate::links::{self, Parsed, WgFields, awg_put, parse_link, wg_proxy};
 use crate::util::*;
 use serde_json::{Map, Value, json};
 
+/// Maximum uncompressed JSON payload accepted from an Amnezia `vpn://` container (4 MiB).
+pub const MAX_AMNEZIA_JSON: usize = 4 * 1024 * 1024;
+
 #[derive(Debug, Default)]
 pub struct Report {
     pub items: Vec<Parsed>,
@@ -59,7 +62,7 @@ fn parse_inner(text: &str, depth: u8) -> Report {
             if !tok.contains("://") {
                 continue;
             }
-            if tok.len() > 6 && tok[..6].eq_ignore_ascii_case("vpn://") {
+            if tok.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("vpn://")) && tok.len() > 6 {
                 match parse_amnezia(tok) {
                     Ok(v) => rep.items.extend(v),
                     Err(e) => rep.errors.push(e),
@@ -79,7 +82,7 @@ fn parse_inner(text: &str, depth: u8) -> Report {
 
 // ---------- Clash / mihomo YAML ----------
 
-const CLASH_TYPES: &[&str] = &["vless", "vmess", "trojan", "ss", "hysteria2", "tuic", "anytls", "wireguard", "openvpn"];
+const CLASH_TYPES: &[&str] = &["vless", "vmess", "trojan", "ss", "hysteria2", "tuic", "anytls", "wireguard", "openvpn", "masque"];
 /// Keys that could reference local files or alter routing; never imported.
 const DROP_KEYS: &[&str] = &[
     "name",
@@ -117,7 +120,7 @@ pub fn clash_proxy(p: &Value) -> Result<Parsed, String> {
         if DROP_KEYS.contains(&k.as_str()) {
             continue;
         }
-        if k == "private-key" && ty != "wireguard" {
+        if k == "private-key" && ty != "wireguard" && ty != "masque" {
             continue; // TLS client key path
         }
         m.insert(k.clone(), v.clone());
@@ -324,14 +327,33 @@ pub fn parse_ovpn(t: &str, name: &str) -> Result<Parsed, String> {
 // ---------- Amnezia vpn:// ----------
 
 pub fn parse_amnezia(s: &str) -> Result<Vec<Parsed>, String> {
-    let body = s.trim()[6..].trim();
+    let trimmed = s.trim();
+    if !trimmed.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("vpn://")) {
+        return Err("vpn://: некорректный префикс".into());
+    }
+    let body = trimmed.get(6..).ok_or("vpn://: пустая ссылка")?.trim();
+    if body.len() > MAX_AMNEZIA_JSON * 2 {
+        return Err("vpn://: превышен допустимый размер конфигурации".into());
+    }
     let raw = b64_decode(body).ok_or("vpn://: не удалось декодировать")?;
+    if raw.len() > MAX_AMNEZIA_JSON {
+        return Err("vpn://: превышен допустимый размер конфигурации".into());
+    }
     let json_bytes = if raw.len() > 4 && raw[4] == 0x78 {
-        // qCompress: 4-byte big-endian length + zlib stream
+        // qCompress: 4-byte big-endian uncompressed length + zlib stream
+        let declared = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+        if declared > MAX_AMNEZIA_JSON {
+            return Err("vpn://: превышен лимит распакованных данных".into());
+        }
         use std::io::Read;
-        let mut d = flate2::read::ZlibDecoder::new(&raw[4..]);
-        let mut out = Vec::new();
-        d.read_to_end(&mut out).map_err(|_| "vpn://: повреждённые данные")?;
+        let d = flate2::read::ZlibDecoder::new(&raw[4..]);
+        let mut out = Vec::with_capacity(declared.min(64 * 1024));
+        d.take((MAX_AMNEZIA_JSON + 1) as u64)
+            .read_to_end(&mut out)
+            .map_err(|_| "vpn://: повреждённые данные")?;
+        if out.len() > MAX_AMNEZIA_JSON {
+            return Err("vpn://: превышен лимит распакованных данных".into());
+        }
         out
     } else {
         raw
@@ -487,6 +509,51 @@ mod tests {
         let enc = b64_encode(plain.as_bytes());
         let r = parse_text(&enc);
         assert_eq!(r.items.len(), 2);
+    }
+
+    #[test]
+    fn unicode_tokens_never_panic() {
+        for sample in [
+            "a://😀x",
+            "Я://😀",
+            "😀://test",
+            "v://😀",
+            "vp://😀",
+            "vpn://😀",
+            "a://😀x vless://u@a.com:443?security=tls#ok",
+            "тест://сервер.рф:443",
+        ] {
+            let r = parse_text(sample);
+            if sample.contains("vless://") {
+                assert_eq!(r.items.len(), 1);
+            }
+        }
+        assert!(parse_amnezia("a://😀x").is_err());
+    }
+
+    #[test]
+    fn amnezia_decompression_bomb_is_rejected() {
+        use base64::Engine;
+        use std::io::Write;
+        // 1. Declared header size exceeds MAX_AMNEZIA_JSON
+        let mut fake_header = ((MAX_AMNEZIA_JSON as u32) + 1024).to_be_bytes().to_vec();
+        fake_header.extend_from_slice(&[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let link = format!("vpn://{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&fake_header));
+        let err = parse_amnezia(&link).unwrap_err();
+        assert!(err.contains("превышен лимит"), "{err}");
+
+        // 2. Small declared header, but actual zlib stream expands past MAX_AMNEZIA_JSON
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        let chunk = vec![b'A'; 64 * 1024];
+        for _ in 0..((MAX_AMNEZIA_JSON / chunk.len()) + 2) {
+            z.write_all(&chunk).unwrap();
+        }
+        let comp = z.finish().unwrap();
+        let mut bomb = 100u32.to_be_bytes().to_vec();
+        bomb.extend(comp);
+        let bomb_link = format!("vpn://{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bomb));
+        let err2 = parse_amnezia(&bomb_link).unwrap_err();
+        assert!(err2.contains("превышен лимит"), "{err2}");
     }
 
     #[test]

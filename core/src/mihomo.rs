@@ -5,6 +5,7 @@ use crate::model::Server;
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -173,11 +174,16 @@ fn regex_escape(s: &str) -> String {
     o
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// Policy for protecting unencrypted HTTP (port 80) from untrusted public nodes.
+/// By default (`allow_direct == false`), when no trusted server (`Mine` or `Warp`) is
+/// available, unencrypted port-80 traffic is blocked (`REJECT`) rather than leaked via `DIRECT`.
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct HttpPolicy {
     pub pool_free: bool,
     pub free_ids: Vec<String>,
     pub trusted_ids: Vec<String>,
+    /// When false (default), `PLAIN` falls back to `REJECT` instead of `DIRECT`, preventing IP leaks.
+    pub allow_direct: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -243,12 +249,13 @@ pub fn main_config(o: &MainOpts) -> Value {
         }),
     ];
     if let Some(policy) = &o.http_policy {
+        let fallback_out = if policy.allow_direct { "DIRECT" } else { "REJECT" };
         if !policy.trusted_ids.is_empty() {
             let filter = format!("^(?:{})$", policy.trusted_ids.iter().map(|i| regex_escape(i)).collect::<Vec<_>>().join("|"));
             groups.push(json!({ "name":"PLAIN-own", "type":"fallback", "use":["pool","extra"], "filter":filter, "url":TEST_URL, "interval":300, "lazy":true, "timeout":5000, "empty-fallback":"REJECT" }));
-            groups.push(json!({ "name":"PLAIN", "type":"fallback", "proxies":["PLAIN-own","DIRECT"], "url":TEST_URL, "interval":300, "lazy":true, "timeout":5000 }));
+            groups.push(json!({ "name":"PLAIN", "type":"fallback", "proxies":["PLAIN-own", fallback_out], "url":TEST_URL, "interval":300, "lazy":true, "timeout":5000 }));
         } else {
-            groups.push(json!({ "name":"PLAIN", "type":"select", "proxies":["DIRECT"] }));
+            groups.push(json!({ "name":"PLAIN", "type":"select", "proxies":[fallback_out] }));
         }
     }
     // Chains: every level is a fallback group of suffixed proxy copies; a copy of
@@ -362,11 +369,12 @@ pub fn main_config(o: &MainOpts) -> Value {
                 "type": "fallback",
                 "proxies": chain_of,
                 "url": TEST_URL,
-                "interval": 180,
-                "lazy": false,
+                "interval": 300,
+                "lazy": true,
                 "timeout": 5000,
                 "max-failed-times": 2,
-                "expected-status": "204"
+                "expected-status": "204",
+                "empty-fallback": "REJECT"
             }));
         }
         if let Via::Chain(cid) = &r.via {
@@ -377,11 +385,12 @@ pub fn main_config(o: &MainOpts) -> Value {
                 "type": "fallback",
                 "proxies": chain_of,
                 "url": TEST_URL,
-                "interval": 180,
-                "lazy": false,
+                "interval": 300,
+                "lazy": true,
                 "timeout": 5000,
                 "max-failed-times": 2,
-                "expected-status": "204"
+                "expected-status": "204",
+                "empty-fallback": "REJECT"
             }));
         }
     }
@@ -715,6 +724,12 @@ pub struct Process {
     pub dir: PathBuf,
 }
 
+impl Drop for Process {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.dir.join(PID_FILE));
+    }
+}
+
 pub struct Spawn<'a> {
     pub bin: &'a Path,
     pub dir: &'a Path,
@@ -771,7 +786,7 @@ impl Process {
                     if g.len() >= 200 {
                         g.pop_front();
                     }
-                    g.push_back(strip_ansi(&l));
+                    g.push_back(crate::providers::redact_secrets(&strip_ansi(&l)));
                 }
             });
         }
@@ -942,11 +957,27 @@ pub fn free_ports(n: usize) -> Vec<u16> {
     ls.iter().filter_map(|l| l.local_addr().ok()).map(|a| a.port()).collect()
 }
 
-/// Writes a file atomically (tmp + rename).
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Writes a file atomically (collision-safe tmp + rename with Windows sharing-violation retry).
 pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = PathBuf::from(format!("{}.{}.{}.tmp", path.display(), std::process::id(), seq));
     std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)
+    let mut last_err = None;
+    for attempt in 0..4 {
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < 3 {
+                    std::thread::sleep(Duration::from_millis(20 * (attempt + 1)));
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("atomic rename failed")))
 }
 
 #[cfg(test)]
@@ -1043,28 +1074,40 @@ mod tests {
     }
 
     #[test]
-    fn plain_http_bypasses_public_servers_only() {
+    fn plain_http_defaults_to_reject_without_leaking_direct() {
         let mut o = opts();
-        o.http_policy = Some(HttpPolicy { pool_free: true, free_ids: vec!["free".into()], trusted_ids: vec!["own".into()] });
+        o.http_policy = Some(HttpPolicy { pool_free: true, free_ids: vec!["free".into()], trusted_ids: vec!["own".into()], allow_direct: false });
         o.routes.push(RoutePlan { id:"r1".into(), via:Via::Servers(vec!["free".into()]), spare:Spare::Vpn, strategy:Default::default() });
         let v = main_config(&o);
         let rules = v["rules"].as_array().unwrap();
         assert!(rules.iter().any(|r| r == "AND,((RULE-SET,rt-r1-sites),(NETWORK,TCP),(DST-PORT,80)),PLAIN"));
         assert!(rules.iter().any(|r| r == "AND,((NETWORK,TCP),(DST-PORT,80)),PLAIN"));
-        assert!(v["proxy-groups"].as_array().unwrap().iter().any(|g| g["name"] == "PLAIN-own"));
-        o.http_policy = Some(HttpPolicy { pool_free:false, free_ids:vec![], trusted_ids:vec!["own".into()] });
-        o.routes.clear();
-        let v = main_config(&o);
-        assert!(!v["rules"].as_array().unwrap().iter().any(|r| r.as_str().unwrap_or("").contains("DST-PORT,80")));
+        let groups = v["proxy-groups"].as_array().unwrap();
+        let plain = groups.iter().find(|g| g["name"] == "PLAIN").unwrap();
+        assert_eq!(plain["proxies"], json!(["PLAIN-own", "REJECT"]));
+
+        // When no trusted servers exist and allow_direct is false, PLAIN selects REJECT
+        o.http_policy = Some(HttpPolicy { pool_free: true, free_ids: vec!["free".into()], trusted_ids: vec![], allow_direct: false });
+        let v2 = main_config(&o);
+        let plain2 = v2["proxy-groups"].as_array().unwrap().iter().find(|g| g["name"] == "PLAIN").unwrap();
+        assert_eq!(plain2["proxies"], json!(["REJECT"]));
+
+        // When allow_direct is explicitly enabled by user, PLAIN falls back to DIRECT
+        o.http_policy = Some(HttpPolicy { pool_free: true, free_ids: vec!["free".into()], trusted_ids: vec![], allow_direct: true });
+        let v3 = main_config(&o);
+        let plain3 = v3["proxy-groups"].as_array().unwrap().iter().find(|g| g["name"] == "PLAIN").unwrap();
+        assert_eq!(plain3["proxies"], json!(["DIRECT"]));
     }
 
     #[test]
-    fn default_server_group_does_not_create_rule_providers() {
+    fn default_server_group_does_not_create_rule_providers_and_is_lazy() {
         let mut o = opts();
         o.routes.push(RoutePlan { id: DEFAULT_ROUTE.into(), via: Via::Servers(vec!["node".into()]), spare: Spare::Vpn, strategy: Default::default() });
         let v = main_config(&o);
         assert_eq!(v["rules"].as_array().unwrap().last().unwrap(), "MATCH,R-__default");
-        assert!(v["proxy-groups"].as_array().unwrap().iter().any(|g| g["name"] == "R-__default"));
+        let r_def = v["proxy-groups"].as_array().unwrap().iter().find(|g| g["name"] == "R-__default").unwrap();
+        assert_eq!(r_def["lazy"], true);
+        assert_eq!(r_def["empty-fallback"], "REJECT");
         assert!(v["rule-providers"].as_object().unwrap().is_empty());
     }
 
