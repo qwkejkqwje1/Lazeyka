@@ -10,6 +10,7 @@ pub mod links;
 pub mod mihomo;
 pub mod model;
 pub mod netif;
+pub mod nettest;
 pub mod probe;
 pub mod routes;
 pub mod scan;

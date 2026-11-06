@@ -62,11 +62,14 @@ pub struct Opts {
     /// Cheap first stage: a plain TCP connect to servers that speak TCP; the closed ones
     /// never reach the (expensive) lab. Only valid when probes go out directly.
     pub prefilter: bool,
+    /// Every server must download [`probe::VOLUME_BYTES`] in one go: where the network
+    /// cuts connections to foreign hosting after ~16 KB, "alive" is not enough.
+    pub volume: bool,
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Opts { batch: 256, parallel: 64, target_good: 12, services: true, udp: true, speed_top: 4, delay_timeout_ms: 5000, want_cc: HashSet::new(), prefilter: false }
+        Opts { batch: 256, parallel: 64, target_good: 12, services: true, udp: true, speed_top: 4, delay_timeout_ms: 5000, want_cc: HashSet::new(), prefilter: false, volume: false }
     }
 }
 
@@ -480,7 +483,7 @@ pub async fn check_relay(env: &Env, list: Vec<Server>, hops: Vec<Server>, o: &Op
                 continue;
             }
             let l = &lab.nodes[nh + i];
-            let nc = probe::NodeCheck { port: l.port, user: l.user.clone(), pass: l.pass.clone(), udp: false, services: o.services };
+            let nc = probe::NodeCheck { port: l.port, user: l.user.clone(), pass: l.pass.clone(), udp: false, services: o.services, volume: o.volume };
             let sem = sem.clone();
             js.spawn(async move {
                 let _permit = sem.acquire_owned().await;
@@ -872,7 +875,7 @@ pub async fn check(env: &Env, list: Vec<Server>, o: &Opts, net: &mut NetInfo, mu
                 continue;
             }
             let l = &lab.nodes[i];
-            let nc = probe::NodeCheck { port: l.port, user: l.user.clone(), pass: l.pass.clone(), udp: o.udp, services: o.services };
+            let nc = probe::NodeCheck { port: l.port, user: l.user.clone(), pass: l.pass.clone(), udp: o.udp, services: o.services, volume: o.volume };
             let sem = sem.clone();
             js.spawn(async move {
                 let _permit = sem.acquire_owned().await;
@@ -946,7 +949,7 @@ pub async fn check_sequential(env: &Env, list: Vec<Server>, o: &Opts, net: &mut 
         let alive = lab.proc.api.proxy_delay(&s.id, mihomo::TEST_URL, o.delay_timeout_ms).await;
         let (p, t) = if alive.is_some() {
             let l = &lab.nodes[i];
-            let nc = probe::NodeCheck { port: l.port, user: l.user.clone(), pass: l.pass.clone(), udp: o.udp, services: o.services };
+            let nc = probe::NodeCheck { port: l.port, user: l.user.clone(), pass: l.pass.clone(), udp: o.udp, services: o.services, volume: o.volume };
             probe::check_node(&nc).await
         } else {
             (Probe { at: util::now(), error: Some("не отвечает".into()), ..Default::default() }, None)

@@ -234,6 +234,61 @@ async fn speed_from(c: &reqwest::Client, url: &str, max_bytes: u64, max_time: Du
     Some(((bytes as f64 * 8.0 / 1000.0) / secs.max(0.05)) as u32)
 }
 
+/// Bytes a server must deliver in one go. Where the provider cuts connections to foreign
+/// hosting after ~16 KB, a server answers the small test requests and then hangs on
+/// anything real; a download of this size tells the two apart.
+pub const VOLUME_BYTES: u64 = 160 * 1024;
+
+/// Error text of a server that stalls after the first kilobytes.
+pub const CUT_ERR: &str = "обрыв после ~16 КБ";
+
+const VOLUME_URLS: &[&str] = &[
+    "https://speed.cloudflare.com/__down?bytes={n}",
+    "https://cachefly.cachefly.net/1mb.test",
+    "https://proof.ovh.net/files/10Mb.dat",
+];
+
+/// Result of one download: done, stalled after `n` bytes, or could not start.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Dl {
+    Full,
+    Cut(u64),
+    Fail,
+}
+
+/// Downloads up to `want` bytes; a pause of 5 seconds without data ends it.
+pub async fn download(c: &reqwest::Client, url: &str, want: u64) -> Dl {
+    let rq = c.get(url).header("range", format!("bytes=0-{}", want.saturating_sub(1))).timeout(Duration::from_secs(20));
+    let mut r = match tokio::time::timeout(Duration::from_secs(8), rq.send()).await {
+        Ok(Ok(r)) if r.status().is_success() => r,
+        _ => return Dl::Fail,
+    };
+    let t0 = Instant::now();
+    let mut got: u64 = 0;
+    while got < want && t0.elapsed() < Duration::from_secs(14) {
+        match tokio::time::timeout(Duration::from_secs(5), r.chunk()).await {
+            Ok(Ok(Some(ch))) => got += ch.len() as u64,
+            Ok(Ok(None)) => break,
+            _ => return if got >= want * 3 / 4 { Dl::Full } else { Dl::Cut(got) },
+        }
+    }
+    if got >= want * 3 / 4 { Dl::Full } else { Dl::Cut(got) }
+}
+
+/// The "16 KB" test through a node: `Some(n)` = the download stalled after n bytes,
+/// None = fine (or nothing to judge by: every test file unreachable).
+pub async fn volume_cut(c: &reqwest::Client) -> Option<u64> {
+    for u in VOLUME_URLS {
+        let url = u.replace("{n}", &VOLUME_BYTES.to_string());
+        match download(c, &url, VOLUME_BYTES).await {
+            Dl::Full => return None,
+            Dl::Cut(n) => return Some(n),
+            Dl::Fail => continue,
+        }
+    }
+    None
+}
+
 // ---------------- SOCKS5 UDP + STUN ----------------
 
 async fn socks5_handshake(s: &mut TcpStream, user: &str, pass: &str) -> std::io::Result<()> {
@@ -286,8 +341,19 @@ async fn read_socks_addr(s: &mut TcpStream) -> std::io::Result<SocketAddr> {
     Ok(SocketAddr::new(ip, u16::from_be_bytes(p)))
 }
 
-/// STUN binding through the node's UDP relay. Returns the public mapped address.
-pub async fn udp_stun(port: u16, user: &str, pass: &str, timeout: Duration) -> Result<SocketAddr, String> {
+/// One UDP request/response through a SOCKS5 listener (UDP ASSOCIATE): sends `payload`
+/// to `host:port` (resolved by the listener) up to three times and returns the first
+/// reply that `accept` takes (the SOCKS header already stripped).
+pub async fn udp_exchange(
+    port: u16,
+    user: &str,
+    pass: &str,
+    host: &str,
+    dport: u16,
+    payload: &[u8],
+    timeout: Duration,
+    accept: impl Fn(&[u8]) -> bool,
+) -> Result<Vec<u8>, String> {
     let fut = async {
         let mut ctl = TcpStream::connect(("127.0.0.1", port)).await.map_err(|e| e.to_string())?;
         socks5_handshake(&mut ctl, user, pass).await.map_err(|e| e.to_string())?;
@@ -297,24 +363,38 @@ pub async fn udp_stun(port: u16, user: &str, pass: &str, timeout: Duration) -> R
             relay.set_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
         }
         let sock = UdpSocket::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
-        let host = b"stun.cloudflare.com";
-        let mut tid = [0u8; 12];
-        use rand::RngCore;
-        rand::rng().fill_bytes(&mut tid);
-        let mut pkt = vec![0, 0, 0, 3, host.len() as u8];
-        pkt.extend_from_slice(host);
-        pkt.extend_from_slice(&3478u16.to_be_bytes());
-        pkt.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42]);
-        pkt.extend_from_slice(&tid);
-        let mut buf = vec![0u8; 1500];
+        let mut pkt = match host.parse::<IpAddr>() {
+            Ok(IpAddr::V4(a)) => {
+                let mut v = vec![0, 0, 0, 1];
+                v.extend_from_slice(&a.octets());
+                v
+            }
+            Ok(IpAddr::V6(a)) => {
+                let mut v = vec![0, 0, 0, 4];
+                v.extend_from_slice(&a.octets());
+                v
+            }
+            Err(_) => {
+                let h = host.as_bytes();
+                let mut v = vec![0, 0, 0, 3, h.len().min(255) as u8];
+                v.extend_from_slice(&h[..h.len().min(255)]);
+                v
+            }
+        };
+        pkt.extend_from_slice(&dport.to_be_bytes());
+        pkt.extend_from_slice(payload);
+        let mut buf = vec![0u8; 2048];
         for attempt in 0..3 {
             sock.send_to(&pkt, relay).await.map_err(|e| e.to_string())?;
             let wait = Duration::from_millis(1200 + attempt * 600);
             match tokio::time::timeout(wait, sock.recv_from(&mut buf)).await {
                 Ok(Ok((n, _))) => {
-                    if let Some(a) = parse_socks_udp_stun(&buf[..n], &tid) {
-                        drop(ctl);
-                        return Ok(a);
+                    if let Some(body) = strip_socks_udp(&buf[..n]) {
+                        if accept(body) {
+                            let out = body.to_vec();
+                            drop(ctl);
+                            return Ok(out);
+                        }
                     }
                 }
                 Ok(Err(e)) => return Err(e.to_string()),
@@ -329,7 +409,8 @@ pub async fn udp_stun(port: u16, user: &str, pass: &str, timeout: Duration) -> R
     }
 }
 
-fn parse_socks_udp_stun(p: &[u8], tid: &[u8; 12]) -> Option<SocketAddr> {
+/// The datagram inside a SOCKS5 UDP reply.
+fn strip_socks_udp(p: &[u8]) -> Option<&[u8]> {
     if p.len() < 4 || p[2] != 0 {
         return None;
     }
@@ -339,7 +420,29 @@ fn parse_socks_udp_stun(p: &[u8], tid: &[u8; 12]) -> Option<SocketAddr> {
         3 => 4 + 1 + *p.get(4)? as usize + 2,
         _ => return None,
     };
-    parse_stun(p.get(off..)?, tid)
+    p.get(off..)
+}
+
+/// A STUN binding request with a fresh transaction id.
+pub fn stun_request() -> (Vec<u8>, [u8; 12]) {
+    let mut tid = [0u8; 12];
+    use rand::RngCore;
+    rand::rng().fill_bytes(&mut tid);
+    let mut pkt = vec![0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42];
+    pkt.extend_from_slice(&tid);
+    (pkt, tid)
+}
+
+/// STUN binding through the node's UDP relay. Returns the public mapped address.
+pub async fn udp_stun(port: u16, user: &str, pass: &str, timeout: Duration) -> Result<SocketAddr, String> {
+    stun_via(port, user, pass, "stun.cloudflare.com", 3478, timeout).await
+}
+
+/// STUN binding to `host:dport` through a SOCKS5 listener.
+pub async fn stun_via(port: u16, user: &str, pass: &str, host: &str, dport: u16, timeout: Duration) -> Result<SocketAddr, String> {
+    let (pkt, tid) = stun_request();
+    let body = udp_exchange(port, user, pass, host, dport, &pkt, timeout, |b| parse_stun(b, &tid).is_some()).await?;
+    parse_stun(&body, &tid).ok_or_else(|| "UDP: непонятный ответ".to_string())
 }
 
 pub fn parse_stun(m: &[u8], tid: &[u8; 12]) -> Option<SocketAddr> {
@@ -401,6 +504,8 @@ pub struct NodeCheck {
     pub pass: String,
     pub udp: bool,
     pub services: bool,
+    /// Download test against the "16 KB" cut (see [`VOLUME_BYTES`]).
+    pub volume: bool,
 }
 
 /// Full check of one node. Geo/exclusion decisions are made by the caller.
@@ -433,11 +538,18 @@ pub async fn check_node(nc: &NodeCheck) -> (Probe, Option<Trace>) {
             None
         }
     };
-    let (t, s, u) = tokio::join!(tamper, svc, udp);
+    let volume = async {
+        if nc.volume { volume_cut(&c).await } else { None }
+    };
+    let (t, s, u, v) = tokio::join!(tamper, svc, udp, volume);
     p.services = s | if u == Some(true) { SVC_UDP } else { 0 };
     p.udp = u;
     if t == Some(false) {
         p.error = Some("подмена содержимого".into());
+        return (p, Some(trace));
+    }
+    if v.is_some() {
+        p.error = Some(CUT_ERR.into());
         return (p, Some(trace));
     }
     p.ok = true;
